@@ -99,8 +99,8 @@ function setLayerVisible(name, visible) {
 }
 
 function fitBounds(south, west, north, east, pad) {
-  var p = pad !== undefined ? pad : 0.05;
-  map.fitBounds([[south, west], [north, east]], { padding: [20, 20] });
+  var p = (pad !== undefined) ? Math.round(pad * 400) : 20;
+  map.fitBounds([[south, west], [north, east]], { padding: [p, p] });
 }
 
 function setBaseLayer(name) {

@@ -2,6 +2,7 @@
 Background QThread worker for running analysis functions without blocking the UI.
 """
 from __future__ import annotations
+import inspect
 from typing import Callable, Any
 
 import numpy as np
@@ -38,7 +39,12 @@ class AnalysisWorker(QThread):
     def run(self) -> None:
         try:
             if self._progress_callback:
-                self._kwargs["_progress"] = self._emit_progress
+                try:
+                    sig = inspect.signature(self._func)
+                    if "_progress" in sig.parameters:
+                        self._kwargs["_progress"] = self._emit_progress
+                except (ValueError, TypeError):
+                    pass
             out = self._func(*self._args, **self._kwargs)
             if not self._cancelled:
                 self.result.emit(out)

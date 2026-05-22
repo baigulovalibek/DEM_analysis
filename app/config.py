@@ -27,6 +27,7 @@ COLORMAPS = {
     "hillshade":             "Greys_r",
     "slope":                 "YlOrRd",
     "aspect":                "hsv",
+    "curvature":             "RdBu_r",
     "curvature_profile":     "RdBu_r",
     "curvature_plan":        "RdBu",
     "fill_sinks":            "terrain",

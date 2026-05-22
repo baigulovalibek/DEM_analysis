@@ -53,7 +53,8 @@ class MainWindow(QMainWindow):
         self._viewshed_latlon: Optional[tuple[float, float]] = None
 
         # Pre-computed intermediate results (keyed by DEM name)
-        self._flow_dir_cache: dict = {}
+        self._flow_dir_cache: dict = {}      # D8 int32 codes
+        self._flow_angle_cache: dict = {}    # D-infinity float32 angles
         self._flow_accum_cache: dict = {}
         self._slope_rad_cache: dict = {}
         self._filled_cache: dict = {}
@@ -424,27 +425,32 @@ class MainWindow(QMainWindow):
 
         if k == "flow_accumulation":
             name = dem.name
-            fd   = self._flow_dir_cache.get(name)
-            if fd is None:
+            fd       = self._flow_dir_cache.get(name)
+            fa_angle = self._flow_angle_cache.get(name)
+            if fd is None and fa_angle is None:
                 self._status("Run Flow Direction first.")
                 return None, None
-            def _accum(dem, flow_dir, nodata, _progress=None):
-                return d8_flow_accumulation(dem, flow_dir, nodata=nodata)
-            return _accum, dict(dem=data, flow_dir=fd, nodata=nd)
+            if fa_angle is not None:
+                def _accum_dinf(dem, angle, _progress=None):
+                    return d_inf_flow_accumulation(dem, angle)
+                return _accum_dinf, dict(dem=data, angle=fa_angle)
+            else:
+                def _accum(dem, flow_dir, nodata, _progress=None):
+                    return d8_flow_accumulation(dem, flow_dir, nodata=nodata)
+                return _accum, dict(dem=data, flow_dir=fd, nodata=nd)
 
         if k == "streams":
             name = dem.name
             fa   = self._flow_accum_cache.get(name)
-            fd   = self._flow_dir_cache.get(name)
-            if fa is None or fd is None:
-                self._status("Run Flow Direction and Accumulation first.")
+            if fa is None:
+                self._status("Run Flow Accumulation first.")
                 return None, None
             auto_thr = params.pop("auto_threshold", True)
             user_thr = params.pop("threshold", 1000.0)
-            def _streams(dem, fa, fd, auto_thr, user_thr, _progress=None):
+            def _streams(dem, fa, auto_thr, user_thr, _progress=None):
                 thr = auto_threshold(fa) if auto_thr else user_thr
                 return extract_streams(fa, thr).astype(np.float32)
-            return _streams, dict(dem=data, fa=fa, fd=fd, auto_thr=auto_thr, user_thr=user_thr)
+            return _streams, dict(dem=data, fa=fa, auto_thr=auto_thr, user_thr=user_thr)
 
         # ── Indices ────────────────────────────────────────────────────────
         if k in ("twi", "spi"):
@@ -523,13 +529,21 @@ class MainWindow(QMainWindow):
 
         # Cache intermediate results for dependent analyses
         if product == "slope":
-            from app.core.derivatives.slope import slope as _slope
-            rad = _slope(dem.valid_data, dem.cell_size_m, units="radians")
-            self._slope_rad_cache[dem.name] = rad
+            units = params.get("units", "degrees")
+            if units == "radians":
+                self._slope_rad_cache[dem.name] = result.copy()
+            elif units == "degrees":
+                self._slope_rad_cache[dem.name] = np.radians(result).astype(np.float32)
+            else:  # percent
+                self._slope_rad_cache[dem.name] = np.arctan(result / 100.0).astype(np.float32)
         if product == "fill_sinks":
             self._filled_cache[dem.name] = result
         if product == "flow_direction":
-            self._flow_dir_cache[dem.name] = result.astype(np.int32)
+            if np.issubdtype(result.dtype, np.integer):
+                self._flow_dir_cache[dem.name] = result.astype(np.int32)
+            else:
+                # D-infinity: store float32 angles separately
+                self._flow_angle_cache[dem.name] = result.astype(np.float32)
         if product == "flow_accumulation":
             self._flow_accum_cache[dem.name] = result
 

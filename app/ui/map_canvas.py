@@ -14,7 +14,7 @@ from typing import Optional
 import numpy as np
 from PyQt6.QtCore import QObject, QUrl, pyqtSignal, pyqtSlot
 from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWebEngineCore import QWebEnginePage
+from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtWidgets import QWidget, QVBoxLayout
 
@@ -84,6 +84,10 @@ class MapCanvas(QWidget):
 
     def _setup_ui(self):
         self._view = QWebEngineView(self)
+        # Allow CDN scripts (Leaflet) to load when the page is served from file://
+        self._view.settings().setAttribute(
+            QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True
+        )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._view)
