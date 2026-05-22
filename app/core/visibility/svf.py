@@ -107,6 +107,7 @@ def positive_openness(
     cell_size: float,
     n_directions: int = 8,
     max_radius: int = 50,
+    _progress=None,
 ) -> np.ndarray:
     """
     Positive openness = mean horizon angle above horizontal (Yokoyama et al. 2002).
@@ -115,7 +116,10 @@ def positive_openness(
     z = dem.astype(np.float64)
     angle_sum = np.zeros(z.shape, dtype=np.float64)
 
-    for azimuth in np.linspace(0, 360, n_directions, endpoint=False):
+    directions = np.linspace(0, 360, n_directions, endpoint=False)
+    for i, azimuth in enumerate(directions):
+        if _progress is not None and _progress(int(i / n_directions * 100)):
+            break
         h = _horizon_angles(z, cell_size, azimuth, max_radius)
         angle_sum += np.maximum(h, 0.0)
 
@@ -128,10 +132,11 @@ def negative_openness(
     cell_size: float,
     n_directions: int = 8,
     max_radius: int = 50,
+    _progress=None,
 ) -> np.ndarray:
     """
     Negative openness = same as positive but looking downward (below horizontal).
     Large → deep enclosed depression; small → flat/convex surface.
     """
     # Flip the DEM sign and compute positive openness of the inverted surface
-    return positive_openness(-dem, cell_size, n_directions, max_radius)
+    return positive_openness(-dem, cell_size, n_directions, max_radius, _progress)

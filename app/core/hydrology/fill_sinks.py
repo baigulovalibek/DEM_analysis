@@ -25,6 +25,7 @@ def priority_flood(
     dem: np.ndarray,
     nodata: float = None,
     epsilon: float = 1e-6,
+    _progress=None,
 ) -> np.ndarray:
     """
     Fill depressions using Priority-Flood (Barnes et al. 2014).
@@ -61,8 +62,18 @@ def priority_flood(
         _push_border(r, 0)
         _push_border(r, cols - 1)
 
+    total = max(rows * cols, 1)
+    done = 0
+    next_report = 0
+
     while heap:
         elev, r, c = heapq.heappop(heap)
+
+        done += 1
+        if _progress is not None and done >= next_report:
+            if _progress(int(done / total * 100)):
+                return filled
+            next_report = done + max(1, total // 100)
 
         for dr, dc in _EIGHT_DIRS:
             nr, nc = r + dr, c + dc

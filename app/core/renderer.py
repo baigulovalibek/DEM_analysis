@@ -16,6 +16,22 @@ from PIL import Image
 from PyQt6.QtGui import QImage
 
 
+# Overlays larger than this (in either dimension) are decimated before being
+# encoded as a PNG.  A huge base64 image makes the embedded browser sluggish
+# when several layers are stacked; the overlay stays georeferenced to the same
+# bounds, so decimating only lowers its display resolution.
+_MAX_OVERLAY_DIM = 2048
+
+
+def _decimate(arr: np.ndarray, max_dim: int = _MAX_OVERLAY_DIM) -> np.ndarray:
+    """Stride-subsample a 2-D array so neither dimension exceeds ``max_dim``."""
+    h, w = arr.shape[:2]
+    if h <= max_dim and w <= max_dim:
+        return arr
+    step = int(np.ceil(max(h, w) / max_dim))
+    return arr[::step, ::step]
+
+
 def array_to_rgba(
     data: np.ndarray,
     cmap: str = "terrain",
@@ -66,6 +82,7 @@ def array_to_png_b64(
     nodata: Optional[float] = None,
 ) -> str:
     """Encode array as base64 PNG data-URL suitable for Leaflet imageOverlay."""
+    data = _decimate(data)
     rgba = array_to_rgba(data, cmap, vmin, vmax, nodata, alpha=1.0)
     img = Image.fromarray(rgba, "RGBA")
     buf = io.BytesIO()

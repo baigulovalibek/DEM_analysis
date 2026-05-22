@@ -101,19 +101,20 @@ class View3DDock(QDockWidget):
         verts[..., 1] = ys
         verts[..., 2] = zs
 
-        # Two triangles per cell
-        faces = []
-        for r in range(rows - 1):
-            for c in range(cols - 1):
-                tl = r * cols + c
-                tr = tl + 1
-                bl = (r + 1) * cols + c
-                br = bl + 1
-                faces.append([tl, tr, bl])
-                faces.append([tr, br, bl])
+        # Two triangles per cell — built vectorised (a Python double loop here
+        # noticeably stalls the UI every time the 3D view is refreshed).
+        rr, cc = np.meshgrid(
+            np.arange(rows - 1), np.arange(cols - 1), indexing="ij"
+        )
+        tl = (rr * cols + cc).ravel()
+        tr = tl + 1
+        bl = tl + cols
+        br = bl + 1
+        faces_arr = np.empty((tl.size * 2, 3), dtype=np.int32)
+        faces_arr[0::2] = np.stack([tl, tr, bl], axis=1)
+        faces_arr[1::2] = np.stack([tr, br, bl], axis=1)
 
         verts_flat = verts.reshape(-1, 3)
-        faces_arr  = np.array(faces, dtype=np.int32)
 
         # Colour from texture or slope-based gradient
         if texture is not None:

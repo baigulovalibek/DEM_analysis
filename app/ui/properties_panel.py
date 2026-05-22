@@ -8,9 +8,9 @@ from typing import Optional
 import numpy as np
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QDockWidget, QWidget, QVBoxLayout, QFormLayout,
+    QDockWidget, QWidget, QVBoxLayout, QFormLayout, QHBoxLayout,
     QLabel, QComboBox, QDoubleSpinBox, QPushButton,
-    QGroupBox, QSizePolicy,
+    QGroupBox, QSizePolicy, QSlider,
 )
 
 import matplotlib
@@ -47,6 +47,7 @@ class PropertiesPanel(QDockWidget):
         self._build_ui()
         self._mgr.layer_selected.connect(self._load_layer)
         self._mgr.layer_updated.connect(self._on_layer_updated)
+        self._mgr.layer_renamed.connect(self._on_layer_renamed)
 
     def _build_ui(self):
         container = QWidget()
@@ -104,6 +105,20 @@ class PropertiesPanel(QDockWidget):
         self._cmap_combo.currentTextChanged.connect(self._on_cmap_changed)
         style_layout.addRow("Colormap:", self._cmap_combo)
 
+        # Opacity / alpha control
+        op_row = QWidget()
+        op_layout = QHBoxLayout(op_row)
+        op_layout.setContentsMargins(0, 0, 0, 0)
+        self._opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self._opacity_slider.setRange(0, 100)
+        self._opacity_slider.setValue(75)
+        self._opacity_slider.valueChanged.connect(self._on_opacity_changed)
+        self._opacity_label = QLabel("75%")
+        self._opacity_label.setFixedWidth(36)
+        op_layout.addWidget(self._opacity_slider)
+        op_layout.addWidget(self._opacity_label)
+        style_layout.addRow("Opacity:", op_row)
+
         self._spin_min = QDoubleSpinBox()
         self._spin_min.setRange(-1e9, 1e9)
         self._spin_min.setDecimals(2)
@@ -147,7 +162,10 @@ class PropertiesPanel(QDockWidget):
             self._lbl_std.setText(f"{stats['std']:.4g}")
 
         self._draw_histogram(layer)
+        self._sync_style(layer)
 
+    def _sync_style(self, layer: DemLayer):
+        """Refresh the lightweight style widgets (no histogram redraw)."""
         lo = layer.render_min
         hi = layer.render_max
         if lo is None or hi is None:
@@ -160,15 +178,29 @@ class PropertiesPanel(QDockWidget):
         self._spin_min.blockSignals(False)
         self._spin_max.blockSignals(False)
 
-        cmap = layer.colormap
-        idx = self._cmap_combo.findText(cmap)
+        idx = self._cmap_combo.findText(layer.colormap)
         self._cmap_combo.blockSignals(True)
         self._cmap_combo.setCurrentIndex(max(idx, 0))
         self._cmap_combo.blockSignals(False)
 
+        pct = int(round(layer.opacity * 100))
+        self._opacity_slider.blockSignals(True)
+        self._opacity_slider.setValue(pct)
+        self._opacity_slider.blockSignals(False)
+        self._opacity_label.setText(f"{pct}%")
+
     def _on_layer_updated(self, name: str):
+        # Style/opacity/visibility change — sync widgets only; the histogram
+        # depends solely on the data array, so it never needs redrawing here.
         if name == self._current:
-            self._load_layer(name)
+            layer = self._mgr.get(name)
+            if layer:
+                self._sync_style(layer)
+
+    def _on_layer_renamed(self, old: str, new: str):
+        if self._current == old:
+            self._current = new
+            self._lbl_name.setText(new)
 
     # ── Histogram ─────────────────────────────────────────────────────────
 
@@ -190,6 +222,11 @@ class PropertiesPanel(QDockWidget):
         if self._current:
             self._mgr.set_colormap(self._current, cmap)
             self.style_changed.emit(self._current)
+
+    def _on_opacity_changed(self, value: int):
+        self._opacity_label.setText(f"{value}%")
+        if self._current:
+            self._mgr.set_opacity(self._current, value / 100.0)
 
     def _on_range_changed(self):
         if self._current:

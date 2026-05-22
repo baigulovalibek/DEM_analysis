@@ -14,6 +14,7 @@ class LayerManager(QObject):
     layer_updated = pyqtSignal(str)         # opacity/visibility/style change
     layer_selected = pyqtSignal(str)        # user clicked a layer
     active_dem_changed = pyqtSignal(str)    # which DEM drives analyses
+    layer_renamed = pyqtSignal(str, str)    # (old_name, new_name)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -51,6 +52,34 @@ class LayerManager(QObject):
             if l.name == name:
                 return l
         return None
+
+    def rename(self, old: str, new: str) -> Optional[str]:
+        """
+        Rename a layer.  The requested name is de-duplicated if it clashes with
+        another layer.  Returns the final (possibly suffixed) name, or None if
+        no layer matched or the name was empty.
+        """
+        new = new.strip()
+        layer = self.get(old)
+        if layer is None or not new or new == old:
+            return None
+
+        others = {l.name for l in self._layers if l is not layer}
+        final = new
+        i = 1
+        while final in others:
+            final = f"{new} ({i})"
+            i += 1
+
+        layer.name = final
+        if self._active_dem == old:
+            self._active_dem = final
+        if self._selected == old:
+            self._selected = final
+
+        self.layer_renamed.emit(old, final)
+        self.layers_changed.emit()
+        return final
 
     def all(self) -> List[DemLayer]:
         return list(self._layers)
