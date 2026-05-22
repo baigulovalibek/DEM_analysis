@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>DEM Map</title>
+  <link rel="stylesheet"
+        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        crossorigin=""/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          crossorigin=""></script>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { width: 100%; height: 100%; background: #1e1e1e; }
+    #map { width: 100%; height: 100%; }
+    .leaflet-container { background: #1e1e1e; }
+    /* Scale bar dark styling */
+    .leaflet-control-scale-line {
+      background: rgba(30,30,30,0.8);
+      color: #ccc;
+      border-color: #555;
+    }
+    /* Attribution */
+    .leaflet-control-attribution {
+      background: rgba(30,30,30,0.75) !important;
+      color: #888 !important;
+    }
+    .leaflet-control-attribution a { color: #aaa !important; }
+    /* Crosshair cursor during profile/viewshed tools */
+    .map-crosshair { cursor: crosshair !important; }
+    .map-crosshair .leaflet-interactive { cursor: crosshair !important; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+<script>
+"use strict";
+
+// ── Map setup ─────────────────────────────────────────────────────────────
+var map = L.map('map', {
+  center:     [30, 0],
+  zoom:       3,
+  zoomControl: true,
+  attributionControl: true
+});
+
+L.control.scale({ imperial: false }).addTo(map);
+
+var baseLayers = {
+  osm: L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+  }),
+  satellite: L.tileLayer(
+    'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    maxZoom: 19,
+    attribution: '© Esri'
+  }),
+  topo: L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
+    maxZoom: 17,
+    attribution: '© OpenTopoMap'
+  })
+};
+baseLayers.osm.addTo(map);
+var currentBase = 'osm';
+
+// ── DEM overlay store ──────────────────────────────────────────────────────
+var demLayers = {};     // name → L.imageOverlay
+
+function addDEMOverlay(name, dataUrl, south, west, north, east, opacity) {
+  removeDEMOverlay(name);
+  var bounds = [[south, west], [north, east]];
+  var ov = L.imageOverlay(dataUrl, bounds, {
+    opacity:       opacity,
+    interactive:   false,
+    zIndex:        200,
+    crossOrigin:   true
+  }).addTo(map);
+  demLayers[name] = ov;
+}
+
+function removeDEMOverlay(name) {
+  if (demLayers[name]) {
+    map.removeLayer(demLayers[name]);
+    delete demLayers[name];
+  }
+}
+
+function setLayerOpacity(name, opacity) {
+  if (demLayers[name]) demLayers[name].setOpacity(opacity);
+}
+
+function setLayerVisible(name, visible) {
+  if (!demLayers[name]) return;
+  if (visible) { map.addLayer(demLayers[name]); }
+  else         { map.removeLayer(demLayers[name]); }
+}
+
+function fitBounds(south, west, north, east, pad) {
+  var p = pad !== undefined ? pad : 0.05;
+  map.fitBounds([[south, west], [north, east]], { padding: [20, 20] });
+}
+
+function setBaseLayer(name) {
+  if (currentBase === name) return;
+  map.removeLayer(baseLayers[currentBase]);
+  if (baseLayers[name]) { baseLayers[name].addTo(map); }
+  currentBase = name;
+}
+
+function setView(lat, lon, zoom) {
+  map.setView([lat, lon], zoom !== undefined ? zoom : map.getZoom());
+}
+
+// ── Drawing tools ──────────────────────────────────────────────────────────
+var drawMode     = 'none';   // 'none' | 'profile' | 'viewshed'
+var profilePts   = [];
+var profileLine  = null;
+var markerObserver = null;
+
+function startProfileDraw() {
+  drawMode = 'profile';
+  profilePts = [];
+  if (profileLine) { map.removeLayer(profileLine); profileLine = null; }
+  map.getContainer().classList.add('map-crosshair');
+}
+
+function stopProfileDraw() {
+  drawMode = 'none';
+  map.getContainer().classList.remove('map-crosshair');
+}
+
+function clearProfile() {
+  if (profileLine) { map.removeLayer(profileLine); profileLine = null; }
+  profilePts = [];
+}
+
+function startViewshedDraw() {
+  drawMode = 'viewshed';
+  map.getContainer().classList.add('map-crosshair');
+}
+
+function stopViewshedDraw() {
+  drawMode = 'none';
+  map.getContainer().classList.remove('map-crosshair');
+}
+
+// ── Python bridge (QWebChannel) ────────────────────────────────────────────
+var bridge = null;
+
+new QWebChannel(qt.webChannelTransport, function(channel) {
+  bridge = channel.objects.bridge;
+});
+
+function notifyBridge(method, args) {
+  if (!bridge) return;
+  try { bridge[method].apply(bridge, args); }
+  catch(e) { console.warn('bridge.' + method, e); }
+}
+
+// ── Map event handlers ─────────────────────────────────────────────────────
+map.on('mousemove', function(e) {
+  notifyBridge('onMouseMove', [e.latlng.lat, e.latlng.lng]);
+});
+
+map.on('click', function(e) {
+  var lat = e.latlng.lat, lon = e.latlng.lng;
+
+  if (drawMode === 'profile') {
+    profilePts.push([lat, lon]);
+    if (profileLine) map.removeLayer(profileLine);
+    if (profilePts.length >= 2) {
+      profileLine = L.polyline(profilePts, {
+        color: '#f0c040', weight: 2, dashArray: '6,4'
+      }).addTo(map);
+    }
+    notifyBridge('onProfilePoint', [lat, lon]);
+    return;
+  }
+
+  if (drawMode === 'viewshed') {
+    if (markerObserver) map.removeLayer(markerObserver);
+    markerObserver = L.marker([lat, lon], {
+      icon: L.divIcon({
+        className: '',
+        html: '<div style="width:12px;height:12px;background:#f05;border:2px solid #fff;border-radius:50%;margin:-6px 0 0 -6px;"></div>',
+        iconSize: [0, 0]
+      })
+    }).addTo(map);
+    notifyBridge('onViewshedPoint', [lat, lon]);
+    stopViewshedDraw();
+    return;
+  }
+
+  notifyBridge('onMapClick', [lat, lon]);
+});
+
+map.on('dblclick', function(e) {
+  if (drawMode === 'profile') {
+    stopProfileDraw();
+    notifyBridge('onProfileComplete', []);
+  }
+});
+
+map.on('zoomend moveend', function() {
+  var c = map.getCenter();
+  notifyBridge('onMapMoved', [c.lat, c.lng, map.getZoom()]);
+});
+</script>
+</body>
+</html>
