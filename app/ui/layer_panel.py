@@ -9,7 +9,7 @@ from PyQt6.QtGui import QAction, QIcon
 from PyQt6.QtWidgets import (
     QDockWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QTreeWidget, QTreeWidgetItem, QToolBar, QSlider,
-    QLabel, QMenu, QSizePolicy, QAbstractItemView,
+    QLabel, QMenu, QSizePolicy, QAbstractItemView, QInputDialog,
 )
 
 from app.core.layer_manager import LayerManager
@@ -83,6 +83,7 @@ class LayerPanel(QDockWidget):
         self._tree.customContextMenuRequested.connect(self._context_menu)
         self._tree.itemClicked.connect(self._on_item_clicked)
         self._tree.itemChanged.connect(self._on_item_changed)
+        self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         layout.addWidget(self._tree)
 
         # Opacity slider
@@ -127,6 +128,9 @@ class LayerPanel(QDockWidget):
                 self._building = True
                 item._refresh(layer)
                 self._building = False
+        sel = self._mgr.selected
+        if sel is not None and sel.name == name:
+            self._sync_opacity_slider(sel)
 
     def _highlight(self, name: str):
         item = self._items.get(name)
@@ -134,11 +138,14 @@ class LayerPanel(QDockWidget):
             self._tree.setCurrentItem(item)
             layer = self._mgr.get(name)
             if layer:
-                pct = int(layer.opacity * 100)
-                self._opacity_slider.blockSignals(True)
-                self._opacity_slider.setValue(pct)
-                self._opacity_slider.blockSignals(False)
-                self._opacity_label.setText(f"{pct}%")
+                self._sync_opacity_slider(layer)
+
+    def _sync_opacity_slider(self, layer: DemLayer):
+        pct = int(round(layer.opacity * 100))
+        self._opacity_slider.blockSignals(True)
+        self._opacity_slider.setValue(pct)
+        self._opacity_slider.blockSignals(False)
+        self._opacity_label.setText(f"{pct}%")
 
     # ── Slot handlers ──────────────────────────────────────────────────────
 
@@ -146,6 +153,15 @@ class LayerPanel(QDockWidget):
         if isinstance(item, LayerItem):
             self._mgr.select(item.layer_name)
             self.layer_selected.emit(item.layer_name)
+
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, _col: int):
+        if isinstance(item, LayerItem):
+            self._rename_layer(item.layer_name)
+
+    def _rename_layer(self, name: str):
+        new, ok = QInputDialog.getText(self, "Rename Layer", "New name:", text=name)
+        if ok and new.strip():
+            self._mgr.rename(name, new.strip())
 
     def _on_item_changed(self, item: QTreeWidgetItem, col: int):
         if self._building or not isinstance(item, LayerItem):
@@ -182,6 +198,9 @@ class LayerPanel(QDockWidget):
         menu = QMenu(self)
         menu.addAction("Zoom to Layer").triggered.connect(
             lambda: self.zoom_requested.emit(item.layer_name)
+        )
+        menu.addAction("Rename Layer…").triggered.connect(
+            lambda: self._rename_layer(item.layer_name)
         )
         menu.addAction("Export as GeoTIFF…").triggered.connect(
             lambda: self.export_requested.emit(item.layer_name)

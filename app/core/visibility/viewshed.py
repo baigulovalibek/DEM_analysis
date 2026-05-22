@@ -28,6 +28,7 @@ def viewshed(
     max_radius: float = None,
     correct_curvature: bool = True,
     nodata: float = None,
+    _progress=None,
 ) -> np.ndarray:
     """
     Compute binary viewshed from a single observer point.
@@ -58,6 +59,8 @@ def viewshed(
 
     # Cast a ray to every target cell using Bresenham-like stepping
     for tr in range(rows):
+        if _progress is not None and _progress(int(tr / max(rows, 1) * 100)):
+            return visibility
         for tc in range(cols):
             if tr == observer_row and tc == observer_col:
                 visibility[tr, tc] = 1

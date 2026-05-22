@@ -2,11 +2,14 @@
 DEM data model.  Holds raw elevation array + geospatial metadata.
 """
 from __future__ import annotations
+import itertools
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
+
+_uid_counter = itertools.count(1)
 
 
 @dataclass
@@ -57,6 +60,9 @@ class DemLayer:
     render_min: Optional[float] = None
     render_max: Optional[float] = None
     colormap: str = "terrain"
+
+    # Stable identity — survives renames; used to key intermediate caches.
+    uid: int = field(default_factory=lambda: next(_uid_counter))
 
     # ── computed properties ────────────────────────────────────────────────
 

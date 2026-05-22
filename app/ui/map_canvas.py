@@ -76,6 +76,8 @@ class MapCanvas(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._page_ready = False
+        self._pending_js: list[str] = []
         self._setup_ui()
         self._setup_channel()
         self._load_map()
@@ -106,13 +108,27 @@ class MapCanvas(QWidget):
             url = QUrl.fromLocalFile(str(_HTML_PATH))
         else:
             url = QUrl("about:blank")
+        self._view.loadFinished.connect(self._on_load_finished)
         self._view.load(url)
+
+    def _on_load_finished(self, ok: bool):
+        self._page_ready = bool(ok)
+        if not ok:
+            return
+        # Flush any JS that was requested before the page finished loading
+        # (e.g. a DEM opened from the command line during start-up).
+        pending, self._pending_js = self._pending_js, []
+        for code in pending:
+            self._view.page().runJavaScript(code)
 
     # ── Public API ─────────────────────────────────────────────────────────
 
     def run_js(self, code: str):
-        """Execute JavaScript in the map page."""
-        self._view.page().runJavaScript(code)
+        """Execute JavaScript in the map page, buffering until it is ready."""
+        if self._page_ready:
+            self._view.page().runJavaScript(code)
+        else:
+            self._pending_js.append(code)
 
     # Overlay management
 
@@ -132,9 +148,14 @@ class MapCanvas(QWidget):
             f'addDEMOverlay({json.dumps(layer.name)}, {json.dumps(data_url)}, '
             f'{b.south}, {b.west}, {b.north}, {b.east}, {layer.opacity});'
         )
+        if not layer.visible:
+            self.set_visible(layer.name, False)
 
     def remove_layer(self, name: str):
         self.run_js(f'removeDEMOverlay({json.dumps(name)});')
+
+    def rename_layer(self, old: str, new: str):
+        self.run_js(f'renameDEMOverlay({json.dumps(old)}, {json.dumps(new)});')
 
     def set_opacity(self, name: str, opacity: float):
         self.run_js(f'setLayerOpacity({json.dumps(name)}, {opacity});')
@@ -142,6 +163,9 @@ class MapCanvas(QWidget):
     def set_visible(self, name: str, visible: bool):
         v = "true" if visible else "false"
         self.run_js(f'setLayerVisible({json.dumps(name)}, {v});')
+
+    def set_z_index(self, name: str, z_index: int):
+        self.run_js(f'setLayerZIndex({json.dumps(name)}, {int(z_index)});')
 
     def refresh_layer(self, layer: DemLayer):
         """Re-render and update an existing overlay."""

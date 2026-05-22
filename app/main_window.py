@@ -110,10 +110,12 @@ class MainWindow(QMainWindow):
         self._act_base_osm  = QAction("OSM",       self, checkable=True); self._act_base_osm.setChecked(True)
         self._act_base_sat  = QAction("Satellite",  self, checkable=True)
         self._act_base_topo = QAction("Topo",       self, checkable=True)
+        self._act_base_none = QAction("None",       self, checkable=True)
         tb.addAction(self._act_3d)
         tb.addSeparator()
         tb.addWidget(QLabel(" Base: "))
-        for act in (self._act_base_osm, self._act_base_sat, self._act_base_topo):
+        for act in (self._act_base_osm, self._act_base_sat,
+                    self._act_base_topo, self._act_base_none):
             tb.addAction(act)
 
         self._act_open.triggered.connect(self._open_dem)
@@ -122,6 +124,7 @@ class MainWindow(QMainWindow):
         self._act_base_osm.triggered.connect(lambda: self._set_base("osm"))
         self._act_base_sat.triggered.connect(lambda: self._set_base("satellite"))
         self._act_base_topo.triggered.connect(lambda: self._set_base("topo"))
+        self._act_base_none.triggered.connect(lambda: self._set_base("none"))
 
     def _build_statusbar(self):
         sb = self.statusBar()
@@ -186,12 +189,15 @@ class MainWindow(QMainWindow):
         # Analysis panel
         self._analysis_panel.run_analysis.connect(self._dispatch_analysis)
         self._analysis_panel.start_tool.connect(self._activate_tool)
+        self._analysis_panel.cancel_analysis.connect(self._on_cancel_analysis)
 
         # Properties panel
         self._props_panel.style_changed.connect(self._refresh_layer_on_map)
 
         # Layer manager
         self._mgr.layer_updated.connect(self._on_layer_updated)
+        self._mgr.layer_renamed.connect(self._on_layer_renamed)
+        self._mgr.layers_changed.connect(self._reapply_layer_order)
 
         # Map bridge
         self._map.bridge.mouse_moved.connect(self._on_mouse_moved)
@@ -262,12 +268,11 @@ class MainWindow(QMainWindow):
 
         self._mgr.add(layer)
         self._map.add_layer(layer)
+        self._reapply_layer_order()
         self._map.fit_bounds(layer.bounds)
+        self._mgr.select(layer.name)
         self._sb_crs.setText(f"CRS: {crs.to_epsg() if crs else 'unknown'}")
         self._status(f"Loaded {path.name}  ({layer.shape[0]}×{layer.shape[1]})")
-
-        # Auto-run hillshade
-        self._quick_run("hillshade")
 
     def _export_layer(self, name: str = ""):
         if not name:
@@ -313,6 +318,13 @@ class MainWindow(QMainWindow):
     # ── Layer actions ──────────────────────────────────────────────────────
 
     def _remove_layer(self, name: str):
+        layer = self._mgr.get(name)
+        if layer is not None:
+            # Drop any cached intermediates derived from this layer.
+            for cache in (self._flow_dir_cache, self._flow_angle_cache,
+                          self._flow_accum_cache, self._slope_rad_cache,
+                          self._filled_cache):
+                cache.pop(layer.uid, None)
         self._map.remove_layer(name)
         self._mgr.remove(name)
 
@@ -325,12 +337,24 @@ class MainWindow(QMainWindow):
         layer = self._mgr.get(name)
         if layer:
             self._map.refresh_layer(layer)
+            # Re-adding the overlay resets its stacking order.
+            self._reapply_layer_order()
 
     def _on_layer_updated(self, name: str):
         layer = self._mgr.get(name)
         if layer:
             self._map.set_opacity(name, layer.opacity)
             self._map.set_visible(name, layer.visible)
+
+    def _on_layer_renamed(self, old: str, new: str):
+        self._map.rename_layer(old, new)
+
+    def _reapply_layer_order(self):
+        """Push the layer stacking order to the map (top layer = highest z)."""
+        layers = self._mgr.all()           # index 0 = top of the stack
+        n = len(layers)
+        for i, layer in enumerate(layers):
+            self._map.set_z_index(layer.name, 200 + (n - i))
 
     # ── Analysis dispatch ──────────────────────────────────────────────────
 
@@ -342,27 +366,34 @@ class MainWindow(QMainWindow):
         if dem is None or dem.data is None:
             self._status("No active DEM loaded.")
             return
-        if self._worker and self._worker.isRunning():
-            self._status("Analysis already running — please wait.")
+        if self._worker is not None and self._worker.isRunning():
+            self._status("Analysis already running — please wait or cancel.")
             return
-
-        self._status(f"Running {product}…")
-        self._analysis_panel.set_progress(0)
 
         data = dem.valid_data.astype(np.float64)
         cs = dem.cell_size_m
 
+        # Resolve BEFORE entering the running state so a missing-dependency
+        # bail-out cannot leave the progress bar stuck on screen.
         func, extra = self._resolve_analysis(product, params, data, cs, dem)
         if func is None:
-            return
+            return  # _resolve_analysis already reported why
 
-        self._worker = AnalysisWorker(func, **extra, progress_callback=True)
+        self._status(f"Running {product}…")
+        self._analysis_panel.set_running(True)
+
+        self._worker = AnalysisWorker(func, extra, product=product,
+                                      dem=dem, params=params)
         self._worker.progress.connect(self._analysis_panel.set_progress)
-        self._worker.result.connect(
-            lambda result: self._on_analysis_done(result, product, dem, params)
-        )
-        self._worker.error.connect(self._on_analysis_error)
+        self._worker.result.connect(self._on_worker_result)
+        self._worker.error.connect(self._on_worker_error)
+        self._worker.finished.connect(self._on_worker_finished)
         self._worker.start()
+
+    def _on_cancel_analysis(self):
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.cancel()
+            self._status("Cancelling analysis…")
 
     def _resolve_analysis(self, product, params, data, cs, dem):
         """Map product name → (callable, kwargs_for_worker)."""
@@ -424,24 +455,24 @@ class MainWindow(QMainWindow):
                 return _dinf, dict(dem=data, cell_size=cs, nodata=nd)
 
         if k == "flow_accumulation":
-            name = dem.name
-            fd       = self._flow_dir_cache.get(name)
-            fa_angle = self._flow_angle_cache.get(name)
+            uid = dem.uid
+            fd       = self._flow_dir_cache.get(uid)
+            fa_angle = self._flow_angle_cache.get(uid)
             if fd is None and fa_angle is None:
                 self._status("Run Flow Direction first.")
                 return None, None
             if fa_angle is not None:
                 def _accum_dinf(dem, angle, _progress=None):
-                    return d_inf_flow_accumulation(dem, angle)
+                    return d_inf_flow_accumulation(dem, angle, _progress=_progress)
                 return _accum_dinf, dict(dem=data, angle=fa_angle)
             else:
                 def _accum(dem, flow_dir, nodata, _progress=None):
-                    return d8_flow_accumulation(dem, flow_dir, nodata=nodata)
+                    return d8_flow_accumulation(dem, flow_dir, nodata=nodata,
+                                                _progress=_progress)
                 return _accum, dict(dem=data, flow_dir=fd, nodata=nd)
 
         if k == "streams":
-            name = dem.name
-            fa   = self._flow_accum_cache.get(name)
+            fa   = self._flow_accum_cache.get(dem.uid)
             if fa is None:
                 self._status("Run Flow Accumulation first.")
                 return None, None
@@ -454,9 +485,8 @@ class MainWindow(QMainWindow):
 
         # ── Indices ────────────────────────────────────────────────────────
         if k in ("twi", "spi"):
-            name = dem.name
-            fa   = self._flow_accum_cache.get(name)
-            slp  = self._slope_rad_cache.get(name)
+            fa   = self._flow_accum_cache.get(dem.uid)
+            slp  = self._slope_rad_cache.get(dem.uid)
             if fa is None or slp is None:
                 self._status("Run Slope + Flow Accumulation first.")
                 return None, None
@@ -492,11 +522,13 @@ class MainWindow(QMainWindow):
                 return sky_view_factor, dict(dem=data, cell_size=cs, **params)
             elif out_type == "Positive Openness":
                 def _po(dem, cell_size, n_directions, max_radius, _progress=None):
-                    return positive_openness(dem, cell_size, n_directions, max_radius)
+                    return positive_openness(dem, cell_size, n_directions,
+                                             max_radius, _progress=_progress)
                 return _po, dict(dem=data, cell_size=cs, **params)
             else:
                 def _no(dem, cell_size, n_directions, max_radius, _progress=None):
-                    return negative_openness(dem, cell_size, n_directions, max_radius)
+                    return negative_openness(dem, cell_size, n_directions,
+                                             max_radius, _progress=_progress)
                 return _no, dict(dem=data, cell_size=cs, **params)
 
         if k == "viewshed":
@@ -513,7 +545,8 @@ class MainWindow(QMainWindow):
                     observer_height, target_height, max_radius, correct_curvature,
                     _progress=None):
                 return vw(dem, cell_size, observer_row, observer_col,
-                          observer_height, target_height, max_radius, correct_curvature).astype(np.float32)
+                          observer_height, target_height, max_radius,
+                          correct_curvature, _progress=_progress).astype(np.float32)
             return _vs, dict(dem=data, cell_size=cs,
                              observer_row=r, observer_col=c, **params)
 
@@ -524,32 +557,39 @@ class MainWindow(QMainWindow):
         self._status(f"Unknown analysis: {product}")
         return None, None
 
-    def _on_analysis_done(self, result: np.ndarray, product: str, dem: DemLayer, params: dict):
-        self._analysis_panel.reset_progress()
+    def _on_worker_result(self, result: np.ndarray):
+        worker = self.sender()
+        if worker is None or getattr(worker, "cancelled", False):
+            return
+        product = worker.product
+        dem = worker.dem
+        params = worker.params
+        if dem is None or result is None:
+            return
 
-        # Cache intermediate results for dependent analyses
+        # Cache intermediate results for dependent analyses, keyed by the
+        # DEM's stable uid so the caches survive a layer rename.
         if product == "slope":
             units = params.get("units", "degrees")
             if units == "radians":
-                self._slope_rad_cache[dem.name] = result.copy()
+                self._slope_rad_cache[dem.uid] = result.copy()
             elif units == "degrees":
-                self._slope_rad_cache[dem.name] = np.radians(result).astype(np.float32)
+                self._slope_rad_cache[dem.uid] = np.radians(result).astype(np.float32)
             else:  # percent
-                self._slope_rad_cache[dem.name] = np.arctan(result / 100.0).astype(np.float32)
-        if product == "fill_sinks":
-            self._filled_cache[dem.name] = result
-        if product == "flow_direction":
+                self._slope_rad_cache[dem.uid] = np.arctan(result / 100.0).astype(np.float32)
+        elif product == "fill_sinks":
+            self._filled_cache[dem.uid] = result
+        elif product == "flow_direction":
             if np.issubdtype(result.dtype, np.integer):
-                self._flow_dir_cache[dem.name] = result.astype(np.int32)
+                self._flow_dir_cache[dem.uid] = result.astype(np.int32)
             else:
                 # D-infinity: store float32 angles separately
-                self._flow_angle_cache[dem.name] = result.astype(np.float32)
-        if product == "flow_accumulation":
-            self._flow_accum_cache[dem.name] = result
+                self._flow_angle_cache[dem.uid] = result.astype(np.float32)
+        elif product == "flow_accumulation":
+            self._flow_accum_cache[dem.uid] = result
 
-        name = f"{dem.name} · {product}"
         layer = DemLayer(
-            name=name,
+            name=f"{dem.name} · {product}",
             product=product,
             data=result,
             nodata=dem.nodata,
@@ -564,19 +604,24 @@ class MainWindow(QMainWindow):
         layer.render_min = lo
         layer.render_max = hi
 
-        self._mgr.add(layer)
+        self._mgr.add(layer)               # may de-duplicate layer.name
         self._map.add_layer(layer)
-        self._mgr.select(name)
+        self._reapply_layer_order()
+        self._mgr.select(layer.name)
         self._status(f"✓ {product} computed for {dem.name}")
 
         # Update 3D if visible
         if self._act_3d.isChecked():
             self._update_3d(dem)
 
-    def _on_analysis_error(self, msg: str):
-        self._analysis_panel.reset_progress()
+    def _on_worker_error(self, msg: str):
         QMessageBox.critical(self, "Analysis Error", msg)
         self._status("Analysis failed.")
+
+    def _on_worker_finished(self):
+        self._analysis_panel.set_running(False)
+        if self.sender() is self._worker:
+            self._worker = None
 
     # ── Interactive tools ──────────────────────────────────────────────────
 
@@ -653,6 +698,7 @@ class MainWindow(QMainWindow):
         self._act_base_osm.setChecked(name == "osm")
         self._act_base_sat.setChecked(name == "satellite")
         self._act_base_topo.setChecked(name == "topo")
+        self._act_base_none.setChecked(name == "none")
         self._map.set_base_layer(name)
 
     def _toggle_3d(self, checked: bool):
@@ -681,6 +727,16 @@ class MainWindow(QMainWindow):
     def _status(self, msg: str):
         self._sb_msg.setText(msg)
         self.statusBar().showMessage(msg, 8000)
+
+    # ── Shutdown ───────────────────────────────────────────────────────────
+
+    def closeEvent(self, event):
+        # Stop a running analysis cleanly so the QThread is not destroyed
+        # while still executing.
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.cancel()
+            self._worker.wait(5000)
+        super().closeEvent(event)
 
     # ── About ──────────────────────────────────────────────────────────────
 

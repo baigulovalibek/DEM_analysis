@@ -182,18 +182,15 @@ class TPIForm(_ParamForm):
         self._r    = QSpinBox(); self._r.setRange(1, 200); self._r.setValue(DEFAULT_TPI_RADIUS)
         self._ann  = QCheckBox("Annular window"); self._ann.setChecked(True)
         self._ir   = QSpinBox(); self._ir.setRange(1, 50);  self._ir.setValue(1)
-        self._cls  = QCheckBox("Also compute landform classification"); self._cls.setChecked(False)
         form.addRow("Outer radius (cells):", self._r)
         form.addRow(self._ann)
         form.addRow("Inner radius (cells):", self._ir)
-        form.addRow(self._cls)
 
     def params(self):
         return {
             "radius": self._r.value(),
             "annular": self._ann.isChecked(),
             "inner_radius": self._ir.value(),
-            "classify": self._cls.isChecked(),
         }
 
 
@@ -313,8 +310,9 @@ _TREE_STRUCTURE = [
 class AnalysisPanel(QDockWidget):
     """Dockable analysis control panel."""
 
-    run_analysis = pyqtSignal(str, dict)   # (product_key, params)
-    start_tool   = pyqtSignal(str)         # signal a drawing tool needs activating
+    run_analysis    = pyqtSignal(str, dict)   # (product_key, params)
+    start_tool      = pyqtSignal(str)         # signal a drawing tool needs activating
+    cancel_analysis = pyqtSignal()            # user asked to cancel the running job
 
     def __init__(self, parent=None):
         super().__init__("Analysis", parent)
@@ -377,12 +375,16 @@ class AnalysisPanel(QDockWidget):
         self._btn_tool    = QPushButton("Activate Tool")
         self._btn_compute = QPushButton("Compute")
         self._btn_compute.setDefault(True)
+        self._btn_cancel  = QPushButton("Cancel")
+        self._btn_cancel.setVisible(False)
         btn_layout.addWidget(self._btn_tool)
         btn_layout.addWidget(self._btn_compute)
+        btn_layout.addWidget(self._btn_cancel)
         main_layout.addWidget(btn_row)
 
         self._btn_tool.clicked.connect(self._activate_tool)
         self._btn_compute.clicked.connect(self._compute)
+        self._btn_cancel.clicked.connect(self._on_cancel)
 
         # Progress
         self._progress = QProgressBar()
@@ -423,11 +425,30 @@ class AnalysisPanel(QDockWidget):
         form = self._forms[self._current_product]
         self.run_analysis.emit(self._current_product, form.params())
 
-    # Progress control (called by main window)
-    def set_progress(self, pct: int):
-        self._progress.setVisible(pct < 100)
-        self._progress.setValue(pct)
+    def _on_cancel(self):
+        self._btn_cancel.setEnabled(False)
+        self._btn_cancel.setText("Cancelling…")
+        self.cancel_analysis.emit()
 
-    def reset_progress(self):
-        self._progress.setVisible(False)
-        self._progress.setValue(0)
+    # ── Running state (called by main window) ──────────────────────────────
+
+    def set_running(self, running: bool):
+        """Toggle the panel between idle and 'analysis in progress'."""
+        self._btn_compute.setEnabled(not running)
+        self._btn_cancel.setVisible(running)
+        self._btn_cancel.setEnabled(running)
+        self._btn_cancel.setText("Cancel")
+        if running:
+            # Indeterminate (busy) bar until a real progress value arrives.
+            self._progress.setRange(0, 0)
+            self._progress.setVisible(True)
+        else:
+            self._progress.setVisible(False)
+            self._progress.setRange(0, 100)
+            self._progress.setValue(0)
+
+    def set_progress(self, pct: int):
+        """Switch the bar to determinate mode and show real progress."""
+        self._progress.setRange(0, 100)
+        self._progress.setValue(max(0, min(100, pct)))
+        self._progress.setVisible(True)

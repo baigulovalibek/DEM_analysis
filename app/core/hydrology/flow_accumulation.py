@@ -18,6 +18,7 @@ def d8_flow_accumulation(
     flow_dir: np.ndarray,
     weight: np.ndarray = None,
     nodata: float = None,
+    _progress=None,
 ) -> np.ndarray:
     """
     D8 flow accumulation.
@@ -58,7 +59,13 @@ def d8_flow_accumulation(
     rows_flat = order // cols
     cols_flat = order %  cols
 
-    for r, c in zip(rows_flat, cols_flat):
+    total = max(len(order), 1)
+    report_every = max(1, total // 100)
+
+    for i, (r, c) in enumerate(zip(rows_flat, cols_flat)):
+        if _progress is not None and i % report_every == 0:
+            if _progress(int(i / total * 100)):
+                return accum.astype(np.float32)
         if not valid[r, c]:
             continue
         code = flow_dir[r, c]
@@ -76,6 +83,7 @@ def d_inf_flow_accumulation(
     dem: np.ndarray,
     angle: np.ndarray,
     weight: np.ndarray = None,
+    _progress=None,
 ) -> np.ndarray:
     """
     D-infinity flow accumulation (Tarboton 1997).
@@ -99,7 +107,12 @@ def d_inf_flow_accumulation(
     ]  # 8 cardinal+diagonal neighbours in CCW order starting from E
 
     order = np.argsort(dem.ravel())[::-1]
-    for idx in order:
+    total = max(len(order), 1)
+    report_every = max(1, total // 100)
+    for i, idx in enumerate(order):
+        if _progress is not None and i % report_every == 0:
+            if _progress(int(i / total * 100)):
+                return accum.astype(np.float32)
         r, c = divmod(int(idx), cols)
         if not valid[r, c]:
             continue

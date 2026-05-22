@@ -4,11 +4,9 @@
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>DEM Map</title>
-  <link rel="stylesheet"
-        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-        crossorigin=""/>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-          crossorigin=""></script>
+  <!-- Leaflet is vendored locally so the map works without internet access -->
+  <link rel="stylesheet" href="leaflet/leaflet.css"/>
+  <script src="leaflet/leaflet.js"></script>
   <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -30,13 +28,37 @@
     /* Crosshair cursor during profile/viewshed tools */
     .map-crosshair { cursor: crosshair !important; }
     .map-crosshair .leaflet-interactive { cursor: crosshair !important; }
+    /* Offline / basemap-unavailable banner */
+    #offline-banner {
+      display: none;
+      position: absolute;
+      top: 8px; left: 50%;
+      transform: translateX(-50%);
+      z-index: 1000;
+      background: rgba(120,70,20,0.92);
+      color: #ffd9a8;
+      font: 12px/1.4 sans-serif;
+      padding: 5px 12px;
+      border-radius: 4px;
+      border: 1px solid #c8843a;
+      pointer-events: none;
+    }
   </style>
 </head>
 <body>
   <div id="map"></div>
+  <div id="offline-banner">Basemap tiles unavailable (offline) — DEM overlays still shown</div>
 
 <script>
 "use strict";
+
+// ── Leaflet load guard ─────────────────────────────────────────────────────
+if (typeof L === 'undefined') {
+  document.body.innerHTML =
+    '<div style="color:#ccc;font:14px sans-serif;padding:24px;">' +
+    'Map library failed to load.</div>';
+  throw new Error('Leaflet failed to load');
+}
 
 // ── Map setup ─────────────────────────────────────────────────────────────
 var map = L.map('map', {
@@ -63,21 +85,37 @@ var baseLayers = {
     attribution: '© OpenTopoMap'
   })
 };
-baseLayers.osm.addTo(map);
 var currentBase = 'osm';
+
+// Track tile-loading failures so we can warn the user when offline.
+var tileErrorCount = 0;
+function watchTileErrors(layer) {
+  layer.on('tileerror', function() {
+    tileErrorCount++;
+    if (tileErrorCount >= 3) {
+      document.getElementById('offline-banner').style.display = 'block';
+    }
+  });
+  layer.on('tileload', function() {
+    tileErrorCount = 0;
+    document.getElementById('offline-banner').style.display = 'none';
+  });
+}
+Object.keys(baseLayers).forEach(function(k) { watchTileErrors(baseLayers[k]); });
+baseLayers.osm.addTo(map);
 
 // ── DEM overlay store ──────────────────────────────────────────────────────
 var demLayers = {};     // name → L.imageOverlay
 
-function addDEMOverlay(name, dataUrl, south, west, north, east, opacity) {
+function addDEMOverlay(name, dataUrl, south, west, north, east, opacity, zIndex) {
   removeDEMOverlay(name);
   var bounds = [[south, west], [north, east]];
   var ov = L.imageOverlay(dataUrl, bounds, {
     opacity:       opacity,
     interactive:   false,
-    zIndex:        200,
     crossOrigin:   true
   }).addTo(map);
+  if (zIndex !== undefined) ov.setZIndex(zIndex);
   demLayers[name] = ov;
 }
 
@@ -85,6 +123,13 @@ function removeDEMOverlay(name) {
   if (demLayers[name]) {
     map.removeLayer(demLayers[name]);
     delete demLayers[name];
+  }
+}
+
+function renameDEMOverlay(oldName, newName) {
+  if (demLayers[oldName] && oldName !== newName) {
+    demLayers[newName] = demLayers[oldName];
+    delete demLayers[oldName];
   }
 }
 
@@ -98,6 +143,10 @@ function setLayerVisible(name, visible) {
   else         { map.removeLayer(demLayers[name]); }
 }
 
+function setLayerZIndex(name, zIndex) {
+  if (demLayers[name]) demLayers[name].setZIndex(zIndex);
+}
+
 function fitBounds(south, west, north, east, pad) {
   var p = (pad !== undefined) ? Math.round(pad * 400) : 20;
   map.fitBounds([[south, west], [north, east]], { padding: [p, p] });
@@ -105,8 +154,11 @@ function fitBounds(south, west, north, east, pad) {
 
 function setBaseLayer(name) {
   if (currentBase === name) return;
-  map.removeLayer(baseLayers[currentBase]);
-  if (baseLayers[name]) { baseLayers[name].addTo(map); }
+  if (baseLayers[currentBase]) map.removeLayer(baseLayers[currentBase]);
+  if (baseLayers[name]) {
+    baseLayers[name].addTo(map);
+  }
+  // 'none' → no basemap (useful offline); map keeps its dark background.
   currentBase = name;
 }
 
@@ -150,9 +202,11 @@ function stopViewshedDraw() {
 // ── Python bridge (QWebChannel) ────────────────────────────────────────────
 var bridge = null;
 
-new QWebChannel(qt.webChannelTransport, function(channel) {
-  bridge = channel.objects.bridge;
-});
+if (typeof QWebChannel !== 'undefined' && typeof qt !== 'undefined') {
+  new QWebChannel(qt.webChannelTransport, function(channel) {
+    bridge = channel.objects.bridge;
+  });
+}
 
 function notifyBridge(method, args) {
   if (!bridge) return;
