@@ -6,6 +6,7 @@ from typing import List, Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from app.core import _dem_cache
 from app.core.dem_layer import DemLayer
 
 
@@ -39,7 +40,13 @@ class LayerManager(QObject):
         self.layers_changed.emit()
 
     def remove(self, name: str) -> None:
+        gone = self.get(name)
         self._layers = [l for l in self._layers if l.name != name]
+        if gone is not None and gone.data is not None:
+            # Free the cached float64/NaN conversion of this DEM immediately
+            # — otherwise it lives on until LRU eviction (cap=4) and pins
+            # ~256 MB per 4k² DEM in process memory.
+            _dem_cache.invalidate(gone.data)
         if self._active_dem == name:
             dems = [l for l in self._layers if l.product == "dem"]
             self._active_dem = dems[0].name if dems else None

@@ -6,4 +6,7 @@ rasterio>=1.3.0
 matplotlib>=3.8.0
 pyqtgraph>=0.13.0
 Pillow>=10.0.0
-requests>=2.31.0
+# Optional: install Numba for 20-80x speedups on the hydrology + viewshed
+# kernels (see OPTIMIZATION.md Phase B).  The app runs correctly without
+# it; the pure-Python fallbacks are just slower.
+# numba>=0.59
