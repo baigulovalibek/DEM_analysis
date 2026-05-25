@@ -3,6 +3,9 @@
 This folder contains everything needed to build a portable Windows bundle of
 DEM Analyst and ship updates to testers without re-emailing zips every time.
 
+> **Just want the per-release steps?** See [`RELEASING.md`](./RELEASING.md)
+> — this doc is the background/setup; that one is the recurring workflow.
+
 ---
 
 ## 1. Build a release
