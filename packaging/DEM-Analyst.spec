@@ -40,10 +40,18 @@ ENTRY = str(PROJECT_ROOT / "main.py")
 # --------------------------------------------------------------------------- #
 # Data files
 # --------------------------------------------------------------------------- #
-# Application resources (Leaflet, map.html, Qt stylesheet).
+# Application resources (Leaflet, map.html, Qt stylesheet, GLSL shaders).
+#
+# IMPORTANT: PyInstaller only bundles ``.py`` files inside packages by
+# default — every non-Python asset must be listed here explicitly or the
+# packaged exe will hit FileNotFoundError when it tries to open it.
 datas = [
     (str(PROJECT_ROOT / "resources"), "resources"),
     (str(PROJECT_ROOT / "app" / "ui" / "style.qss"), "app/ui"),
+    # 3D viewport shaders — opened by gl_widget.py at GL init time.
+    # Missing these is a guaranteed crash the moment the user opens 3D View.
+    (str(PROJECT_ROOT / "app" / "ui" / "view3d" / "shaders"),
+     "app/ui/view3d/shaders"),
 ]
 
 # rasterio ships GDAL_DATA and PROJ_DATA as package data; the hook usually
@@ -52,13 +60,43 @@ datas = [
 datas += collect_data_files("rasterio", subdir="gdal_data")
 datas += collect_data_files("rasterio", subdir="proj_data")
 
-# numba & llvmlite ship a few .py files PyInstaller's modulegraph can miss.
+# Hidden imports — modules PyInstaller's static analysis misses because
+# they are imported lazily (inside functions) or behind ``try/except``.
 hiddenimports = []
 hiddenimports += collect_submodules("rasterio")
 hiddenimports += ["rasterio._shim", "rasterio.vrt", "rasterio.sample",
                   "rasterio.crs", "rasterio.transform", "rasterio.warp"]
 hiddenimports += ["scipy.ndimage"]
 hiddenimports += ["pyqtgraph.opengl"]
+# pandas is imported INSIDE methods in app/core/earthquakes.py — PyInstaller's
+# scanner sometimes misses deferred imports, and openpyxl is pandas' xlsx
+# backend (also lazy-imported when the user picks a .xlsx catalog).
+hiddenimports += ["pandas", "openpyxl"]
+# PyOpenGL is imported behind a try/except in app/ui/view3d/gl_widget.py.
+# Without explicit hidden imports PyInstaller can skip it, and then the 3D
+# viewport silently disables itself with a misleading "driver missing" hint.
+# OpenGL.platform.* is OS-specific — the wrong submodule listed here is
+# benign on the build host (still produces a working bundle for that OS)
+# but adds dead weight, so pick the one that matches sys.platform.
+hiddenimports += [
+    "OpenGL",
+    "OpenGL.GL",
+    "OpenGL.GL.shaders",
+    "OpenGL.arrays",
+    "OpenGL.arrays.ctypesarrays",
+    "OpenGL.arrays.ctypesparameters",
+    "OpenGL.arrays.ctypespointers",
+    "OpenGL.arrays.lists",
+    "OpenGL.arrays.numbers",
+    "OpenGL.arrays.numpymodule",
+    "OpenGL.arrays.strings",
+]
+if sys.platform == "win32":
+    hiddenimports += ["OpenGL.platform.win32"]
+elif sys.platform == "darwin":
+    hiddenimports += ["OpenGL.platform.darwin"]
+else:
+    hiddenimports += ["OpenGL.platform.glx", "OpenGL.platform.egl"]
 
 # GDAL DLLs that rasterio loads at runtime.
 binaries = []
