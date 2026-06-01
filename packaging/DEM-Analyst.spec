@@ -153,9 +153,14 @@ SCIPY_EXCLUDES = [
 # matplotlib.
 # NB: do NOT exclude "distutils" — PyInstaller's own pre-import hook aliases
 # the setuptools-vendored copy and an exclusion makes the build crash.
+# NB: do NOT exclude "pydoc"/"pydoc_data"/"doctest" — scipy._lib._docscrape
+# (pulled in by `import scipy.ndimage`) imports pydoc unconditionally. Excluding
+# it makes EVERY analysis silently no-op: _resolve_analysis imports scipy.ndimage
+# on the GUI thread, the ModuleNotFoundError escapes the Qt slot, and the
+# Compute button appears dead with no error dialog. These stdlib modules are
+# tiny — not worth the breakage.
 GENERIC_EXCLUDES = [
     "tkinter", "_tkinter", "tcl", "tk", "turtle", "turtledemo",
-    "doctest", "pydoc", "pydoc_data",
     "xmlrpc", "lib2to3",
     "matplotlib.tests", "numpy.tests", "scipy.tests",
     "IPython", "jupyter", "notebook", "sphinx",

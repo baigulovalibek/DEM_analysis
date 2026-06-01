@@ -20,12 +20,23 @@ def spi(
     Parameters
     ----------
     log_scale : if True return ln(SPI+1) to compress the dynamic range
+
+    Cells with zero contributing area or non-finite slope (outlets, nodata,
+    slope-stencil edges) are masked to NaN so consumers don't mistake
+    "no data" for genuinely zero erosive power.
     """
-    a = specific_catchment_area(flow_accum, cell_size).astype(np.float64)
-    beta = slope_rad.astype(np.float64)
-    raw = a * np.tan(np.maximum(beta, 0.0))
-    if log_scale:
-        result = np.log1p(raw)
-    else:
-        result = raw
-    return result.astype(np.float32)
+    fa = flow_accum.astype(np.float64)
+    sr = slope_rad.astype(np.float64)
+
+    a = specific_catchment_area(fa, cell_size).astype(np.float64)
+    with np.errstate(invalid="ignore"):
+        raw = a * np.tan(np.maximum(sr, 0.0))
+        if log_scale:
+            result = np.log1p(raw)
+        else:
+            result = raw
+
+    invalid = (fa <= 0) | ~np.isfinite(sr) | ~np.isfinite(result)
+    out = result.astype(np.float32)
+    out[invalid] = np.nan
+    return out

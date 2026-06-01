@@ -14,6 +14,12 @@ from PyQt6.QtWidgets import (
 
 from app.core.layer_manager import LayerManager
 from app.core.dem_layer import DemLayer
+from app.core.earthquakes import EarthquakeCatalog
+
+
+# Special marker so the rest of the panel can recognise the earthquake item
+# without having to compare against the dynamic "Earthquakes (N)" string.
+_EQ_SENTINEL = "__earthquakes__"
 
 
 class LayerItem(QTreeWidgetItem):
@@ -28,6 +34,33 @@ class LayerItem(QTreeWidgetItem):
         self.setToolTip(0, f"{layer.product}  ·  {layer.shape[0]}×{layer.shape[1]}")
 
 
+class EarthquakeItem(QTreeWidgetItem):
+    """Fixed entry that represents the loaded earthquake catalog."""
+
+    def __init__(self, catalog: Optional[EarthquakeCatalog]):
+        super().__init__()
+        self.layer_name = _EQ_SENTINEL
+        self._refresh(catalog)
+
+    def _refresh(self, catalog: Optional[EarthquakeCatalog]):
+        if catalog is None or len(catalog) == 0:
+            self.setText(0, "Earthquakes (none)")
+            self.setCheckState(0, Qt.CheckState.Unchecked)
+            self.setToolTip(0, "No earthquake catalog loaded")
+            self.setDisabled(True)
+            return
+        self.setDisabled(False)
+        n_total = len(catalog)
+        n_vis = int(catalog.visible_indices().size)
+        self.setText(0, f"Earthquakes ({n_vis}/{n_total})")
+        self.setCheckState(
+            0,
+            Qt.CheckState.Checked if catalog.style.visible else Qt.CheckState.Unchecked,
+        )
+        src = catalog.source_path.name if catalog.source_path else "in-memory"
+        self.setToolTip(0, f"{src}\n{n_vis} of {n_total} events visible")
+
+
 class LayerPanel(QDockWidget):
     """Dockable layer tree panel."""
 
@@ -38,10 +71,20 @@ class LayerPanel(QDockWidget):
     export_requested  = pyqtSignal(str)
     active_dem_change = pyqtSignal(str)
 
+    # Earthquake catalog signals.  Kept distinct from the raster ones so
+    # MainWindow doesn't have to discriminate inside a single slot.
+    earthquake_selected      = pyqtSignal()
+    earthquake_visibility_toggled = pyqtSignal(bool)
+    earthquake_zoom_requested = pyqtSignal()
+    earthquake_remove_requested = pyqtSignal()
+    earthquake_open_requested  = pyqtSignal()   # File→Open Earthquake Catalog…
+
     def __init__(self, manager: LayerManager, parent=None):
         super().__init__("Layers", parent)
         self._mgr = manager
         self._items: dict[str, LayerItem] = {}
+        self._eq_item: Optional[EarthquakeItem] = None
+        self._catalog: Optional[EarthquakeCatalog] = None
         self._building = False
 
         self.setMinimumWidth(200)
@@ -52,6 +95,9 @@ class LayerPanel(QDockWidget):
 
         self._build_ui()
         self._connect_manager()
+        # Render the (empty-catalog) Earthquakes row immediately so the user
+        # can see how to load one even before any DEM is opened.
+        self._rebuild()
 
     def _build_ui(self):
         container = QWidget()
@@ -114,11 +160,35 @@ class LayerPanel(QDockWidget):
         self._building = True
         self._tree.clear()
         self._items.clear()
+        # Earthquake row only appears once a catalog has actually been loaded;
+        # an empty "Earthquakes (none)" row looks like a phantom layer the
+        # user can't get rid of.  Open Earthquake Catalog… in the File menu
+        # is the entry point when no catalog is loaded yet.
+        if self._catalog is not None and len(self._catalog) > 0:
+            self._eq_item = EarthquakeItem(self._catalog)
+            self._tree.addTopLevelItem(self._eq_item)
+        else:
+            self._eq_item = None
         for layer in self._mgr.all():
             item = LayerItem(layer)
             self._tree.addTopLevelItem(item)
             self._items[layer.name] = item
         self._building = False
+
+    # ── Public hook for MainWindow ─────────────────────────────────────────
+
+    def set_catalog(self, catalog: Optional[EarthquakeCatalog]):
+        """Called by MainWindow whenever the loaded catalog changes."""
+        self._catalog = catalog
+        # Rebuild so the row's visible/total counts are accurate.
+        self._rebuild()
+
+    def refresh_catalog_counts(self):
+        """Re-read the catalog row after a filter change (no full rebuild)."""
+        if self._eq_item is not None:
+            self._building = True
+            self._eq_item._refresh(self._catalog)
+            self._building = False
 
     def _update_item(self, name: str):
         item = self._items.get(name)
@@ -153,10 +223,16 @@ class LayerPanel(QDockWidget):
         if isinstance(item, LayerItem):
             self._mgr.select(item.layer_name)
             self.layer_selected.emit(item.layer_name)
+        elif isinstance(item, EarthquakeItem):
+            self.earthquake_selected.emit()
 
     def _on_item_double_clicked(self, item: QTreeWidgetItem, _col: int):
         if isinstance(item, LayerItem):
             self._rename_layer(item.layer_name)
+        elif isinstance(item, EarthquakeItem):
+            # Same convention as raster rows: double-click zooms to the data.
+            if self._catalog and len(self._catalog) > 0:
+                self.earthquake_zoom_requested.emit()
 
     def _rename_layer(self, name: str):
         new, ok = QInputDialog.getText(self, "Rename Layer", "New name:", text=name)
@@ -164,11 +240,15 @@ class LayerPanel(QDockWidget):
             self._mgr.rename(name, new.strip())
 
     def _on_item_changed(self, item: QTreeWidgetItem, col: int):
-        if self._building or not isinstance(item, LayerItem):
+        if self._building:
             return
-        visible = item.checkState(0) == Qt.CheckState.Checked
-        self._mgr.set_visible(item.layer_name, visible)
-        self.visibility_toggled.emit(item.layer_name, visible)
+        if isinstance(item, LayerItem):
+            visible = item.checkState(0) == Qt.CheckState.Checked
+            self._mgr.set_visible(item.layer_name, visible)
+            self.visibility_toggled.emit(item.layer_name, visible)
+        elif isinstance(item, EarthquakeItem) and self._catalog is not None:
+            visible = item.checkState(0) == Qt.CheckState.Checked
+            self.earthquake_visibility_toggled.emit(visible)
 
     def _on_opacity_changed(self, value: int):
         self._opacity_label.setText(f"{value}%")
@@ -180,11 +260,15 @@ class LayerPanel(QDockWidget):
         layer = self._mgr.selected
         if layer:
             self._mgr.move_up(layer.name)
+            # Preserve the selection through the rebuild so the properties
+            # panel doesn't flip back to whatever was previously selected.
+            self._mgr.select(layer.name)
 
     def _move_down(self):
         layer = self._mgr.selected
         if layer:
             self._mgr.move_down(layer.name)
+            self._mgr.select(layer.name)
 
     def _remove_selected(self):
         layer = self._mgr.selected
@@ -193,7 +277,29 @@ class LayerPanel(QDockWidget):
 
     def _context_menu(self, pos):
         item = self._tree.itemAt(pos)
+        if isinstance(item, EarthquakeItem):
+            menu = QMenu(self)
+            menu.addAction("Open Earthquake Catalog…").triggered.connect(
+                self.earthquake_open_requested
+            )
+            has_data = self._catalog is not None and len(self._catalog) > 0
+            zoom = menu.addAction("Zoom to Earthquakes")
+            zoom.setEnabled(has_data)
+            zoom.triggered.connect(self.earthquake_zoom_requested)
+            remove = menu.addAction("Clear Catalog")
+            remove.setEnabled(has_data)
+            remove.triggered.connect(self.earthquake_remove_requested)
+            menu.exec(self._tree.mapToGlobal(pos))
+            return
         if not isinstance(item, LayerItem):
+            # Right-click in the empty area of the tree still exposes the
+            # "Open Earthquake Catalog…" affordance now that the persistent
+            # phantom row is gone.
+            menu = QMenu(self)
+            menu.addAction("Open Earthquake Catalog…").triggered.connect(
+                self.earthquake_open_requested
+            )
+            menu.exec(self._tree.mapToGlobal(pos))
             return
         menu = QMenu(self)
         menu.addAction("Zoom to Layer").triggered.connect(

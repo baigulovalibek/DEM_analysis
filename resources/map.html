@@ -25,6 +25,15 @@
       color: #888 !important;
     }
     .leaflet-control-attribution a { color: #aaa !important; }
+    /* Smooth interpolation for DEM image overlays.  By default some
+       browser/leaflet combinations render PNG overlays with nearest-neighbour
+       upscaling, which makes derived rasters look very blocky when zoomed in.
+       The values below ask for smooth (bilinear) scaling. */
+    .leaflet-image-layer {
+      image-rendering: auto;
+      image-rendering: smooth;
+      image-rendering: -webkit-optimize-contrast;
+    }
     /* Crosshair cursor during profile/viewshed tools */
     .map-crosshair { cursor: crosshair !important; }
     .map-crosshair .leaflet-interactive { cursor: crosshair !important; }
@@ -42,6 +51,67 @@
       border-radius: 4px;
       border: 1px solid #c8843a;
       pointer-events: none;
+    }
+    /* Earthquake popup — dark theme that matches the dock styling */
+    .leaflet-popup-content-wrapper, .leaflet-popup-tip {
+      background: #2a2a2a;
+      color: #ddd;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.5);
+    }
+    .leaflet-popup-content {
+      font: 11px/1.45 sans-serif;
+      margin: 8px 12px;
+    }
+    .leaflet-popup-content .eq-title {
+      font-weight: bold;
+      font-size: 12px;
+      margin-bottom: 4px;
+      color: #fff;
+    }
+    .leaflet-popup-content table {
+      border-collapse: collapse;
+      width: 100%;
+    }
+    .leaflet-popup-content td {
+      padding: 1px 4px 1px 0;
+      vertical-align: top;
+    }
+    .leaflet-popup-content td.k { color: #888; }
+    .leaflet-popup-close-button { color: #aaa !important; }
+    /* Earthquake depth legend */
+    .eq-legend {
+      background: rgba(30,30,30,0.85);
+      color: #ddd;
+      padding: 6px 8px 4px;
+      border: 1px solid #555;
+      border-radius: 4px;
+      font: 10px/1.3 sans-serif;
+      min-width: 110px;
+    }
+    .eq-legend .eq-legend-title {
+      font-weight: bold;
+      margin-bottom: 3px;
+      color: #fff;
+      text-transform: capitalize;
+    }
+    .eq-legend .eq-legend-ramp {
+      height: 10px;
+      border: 1px solid #444;
+      margin-bottom: 2px;
+    }
+    .eq-legend .eq-legend-row {
+      display: flex;
+      justify-content: space-between;
+      color: #aaa;
+    }
+    /* Highlighted earthquake (clicked from 2D or 3D) */
+    .eq-highlight {
+      animation: eq-pulse 1.0s ease-out 2;
+    }
+    @keyframes eq-pulse {
+      0%   { stroke-width: 2; }
+      50%  { stroke-width: 6; }
+      100% { stroke-width: 2; }
     }
   </style>
 </head>
@@ -69,6 +139,16 @@ var map = L.map('map', {
 });
 
 L.control.scale({ imperial: false }).addTo(map);
+
+// Dedicated pane for the earthquake markers — sits above the DEM
+// imageOverlays (which live in overlayPane at z-index 400 + the per-layer
+// setZIndex of 200+).  Without this, raster layers placed on top of the
+// catalog hide the markers.
+map.createPane('earthquakePane');
+map.getPane('earthquakePane').style.zIndex = 650;
+// The canvas itself sits in the same pane so individual circleMarkers can't
+// be punched through by image overlays.
+map.getPane('earthquakePane').style.pointerEvents = 'auto';
 
 var baseLayers = {
   osm: L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -104,16 +184,50 @@ function watchTileErrors(layer) {
 Object.keys(baseLayers).forEach(function(k) { watchTileErrors(baseLayers[k]); });
 baseLayers.osm.addTo(map);
 
+// ── 3D camera frustum overlay ─────────────────────────────────────────────
+// Drawn as a translucent polygon plus a small wedge at the camera location.
+// Cleared when Python passes null.
+var cameraFrustum   = null;
+var cameraHeadingMk = null;
+
+function setCameraFrustum(corners /* [[lat, lon], …, [lat, lon]] or null */,
+                          cameraLatLon /* [lat, lon] or null */) {
+  if (cameraFrustum)   { map.removeLayer(cameraFrustum);   cameraFrustum = null; }
+  if (cameraHeadingMk) { map.removeLayer(cameraHeadingMk); cameraHeadingMk = null; }
+  if (!corners || corners.length < 3) return;
+
+  cameraFrustum = L.polygon(corners, {
+    color:       '#5fb3ff',
+    weight:      1.5,
+    opacity:     0.9,
+    fillColor:   '#5fb3ff',
+    fillOpacity: 0.15,
+    interactive: false,
+    pane:        'overlayPane'
+  }).addTo(map);
+
+  if (cameraLatLon) {
+    cameraHeadingMk = L.circleMarker(cameraLatLon, {
+      radius: 4, color: '#ffffff', weight: 2,
+      fillColor: '#5fb3ff', fillOpacity: 0.9,
+      interactive: false
+    }).addTo(map);
+  }
+}
+
 // ── DEM overlay store ──────────────────────────────────────────────────────
 var demLayers = {};     // name → L.imageOverlay
 
 function addDEMOverlay(name, dataUrl, south, west, north, east, opacity, zIndex) {
   removeDEMOverlay(name);
   var bounds = [[south, west], [north, east]];
+  // NB: do NOT pass crossOrigin on a data: URL. Some Chromium builds (the one
+  // shipping with QtWebEngine 6.5/6.6) reject anonymous-CORS requests on
+  // data URLs and the imageOverlay then never renders — symptom on the
+  // client side is "I open my DEM but nothing appears on the map".
   var ov = L.imageOverlay(dataUrl, bounds, {
     opacity:       opacity,
-    interactive:   false,
-    crossOrigin:   true
+    interactive:   false
   }).addTo(map);
   if (zIndex !== undefined) ov.setZIndex(zIndex);
   demLayers[name] = ov;
@@ -166,8 +280,223 @@ function setView(lat, lon, zoom) {
   map.setView([lat, lon], zoom !== undefined ? zoom : map.getZoom());
 }
 
+// ── Earthquake catalog overlay ─────────────────────────────────────────────
+// Events are rendered as circleMarkers on a dedicated canvas renderer so that
+// hundreds (or thousands) of points stay smooth.  Depth is encoded as fill
+// colour and magnitude as radius — both consistent with the 3D view.
+var eqRenderer    = L.canvas({ padding: 0.5, pane: 'earthquakePane' });
+var eqLayer       = null;   // L.featureGroup of circleMarkers
+var eqEvents      = [];     // payload as supplied by Python
+var eqStyle       = null;   // last style payload
+var eqMarkerByIdx = {};     // idx → L.circleMarker
+var eqLegend      = null;   // L.control rendered in bottom-right
+var eqHighlighted = null;   // idx currently highlighted, or null
+
+function _eqRadius(mag, scale) {
+  // Log-energy curve: each magnitude unit ≈ 32× energy → ~1.6× linear
+  // radius.  Linear scaling flattened M5..M9 into one blob; this keeps the
+  // whole range readable.  3D uses a larger base because point sprites
+  // need more pixels to register as the focal element of a 3D scene;
+  // 2D markers can stay small because the map is the focal element.
+  var s = scale || 1.0;
+  var r = 2.0 + 0.55 * Math.pow(1.6, Math.max(mag, 0));
+  r = r * s;
+  return Math.max(2.0, Math.min(30.0 * Math.max(s, 1.0), r));
+}
+
+function _eqInterp(t, ramp) {
+  // 5-stop linear interpolation in 0..1 → "#rrggbb"
+  t = Math.max(0, Math.min(1, t));
+  var i = Math.min(Math.floor(t * (ramp.length - 1)), ramp.length - 2);
+  var f = t * (ramp.length - 1) - i;
+  var a = ramp[i], b = ramp[i + 1];
+  var r = Math.round(a[0] + (b[0] - a[0]) * f);
+  var g = Math.round(a[1] + (b[1] - a[1]) * f);
+  var bb = Math.round(a[2] + (b[2] - a[2]) * f);
+  return 'rgb(' + r + ',' + g + ',' + bb + ')';
+}
+
+function _eqMakePopup(ev, style) {
+  var fieldLabel = (style && style.color_by) || 'depth';
+  var depth = ev.depth.toFixed(2);
+  var lat = ev.lat.toFixed(4);
+  var lon = ev.lon.toFixed(4);
+  var mag = ev.mag.toFixed(2);
+  var time = ev.time ? new Date(ev.time).toISOString().replace('T', ' ').slice(0, 19) : '—';
+  var rows = '';
+  if (ev.extras) {
+    for (var k in ev.extras) {
+      var v = ev.extras[k];
+      if (v === null || v === undefined) continue;
+      var disp = (typeof v === 'number') ? Number(v).toPrecision(4) : String(v);
+      rows += '<tr><td class="k">' + k + '</td><td>' + disp + '</td></tr>';
+    }
+  }
+  return (
+    '<div class="eq-title">Earthquake · M' + mag + '</div>' +
+    '<table>' +
+      '<tr><td class="k">Time</td><td>' + time + ' UTC</td></tr>' +
+      '<tr><td class="k">Lat / Lon</td><td>' + lat + '°, ' + lon + '°</td></tr>' +
+      '<tr><td class="k">Depth</td><td>' + depth + ' km</td></tr>' +
+      '<tr><td class="k">Magnitude</td><td>' + mag + '</td></tr>' +
+      rows +
+    '</table>'
+  );
+}
+
+function setEarthquakes(events, style) {
+  // ``events`` is an array of {idx, lat, lon, depth, mag, time, extras}.
+  // ``style`` is the EarthquakeStyle serialised to JSON.  Replaces the entire
+  // catalog overlay (cheap for the catalog sizes we expect; if it ever grows
+  // to 100k events we can switch to a sparse update).
+  clearEarthquakes();
+  eqEvents = events || [];
+  eqStyle = style || {};
+  if (!style || !style.visible) {
+    _ensureLegend();
+    return;
+  }
+  eqLayer = L.featureGroup();
+  for (var i = 0; i < eqEvents.length; i++) {
+    var ev = eqEvents[i];
+    var marker = _eqMakeMarker(ev, style);
+    if (marker) {
+      eqLayer.addLayer(marker);
+      eqMarkerByIdx[ev.idx] = marker;
+    }
+  }
+  eqLayer.addTo(map);
+  _ensureLegend();
+}
+
+function _eqMakeMarker(ev, style) {
+  var fill = _eqInterp(_eqColorT(ev, style), _eqRamp(style.colormap));
+  var marker = L.circleMarker([ev.lat, ev.lon], {
+    renderer:     eqRenderer,
+    pane:         'earthquakePane',
+    radius:       _eqRadius(ev.mag, style.size_scale),
+    color:        '#111',
+    weight:       1,
+    opacity:      0.95,
+    fillColor:    fill,
+    fillOpacity:  0.85,
+    bubblingMouseEvents: false
+  });
+  marker.bindPopup(_eqMakePopup(ev, style), { className: 'eq-popup', autoPan: true });
+  marker.bindTooltip(
+    'M' + ev.mag.toFixed(1) + ' · ' + ev.depth.toFixed(1) + ' km' +
+    (ev.time ? ' · ' + ev.time.slice(0, 10) : ''),
+    { direction: 'top', offset: [0, -4], opacity: 0.9 }
+  );
+  marker.on('click', function() {
+    notifyBridge('onEarthquakeClick', [ev.idx]);
+  });
+  return marker;
+}
+
+function _eqColorT(ev, style) {
+  var lo = (style.color_min !== null && style.color_min !== undefined) ? style.color_min : 0;
+  var hi = (style.color_max !== null && style.color_max !== undefined) ? style.color_max : 1;
+  if (hi <= lo) hi = lo + 1;
+  var v;
+  if (style.color_by === 'magnitude') v = ev.mag;
+  else if (style.color_by === 'time') v = ev.time ? (new Date(ev.time).getTime() / 1000) : (lo + hi) / 2;
+  else v = ev.depth;
+  return (v - lo) / (hi - lo);
+}
+
+// A compact set of color ramps so the 2D view doesn't need to call back into
+// Python to resolve a matplotlib cmap.  Names match matplotlib where they
+// exist.  Extend here when adding a new option to the properties panel.
+var EQ_RAMPS = {
+  plasma:  [[13,8,135],[126,3,168],[204,71,120],[248,149,64],[240,249,33]],
+  viridis: [[68,1,84],[59,82,139],[33,144,141],[94,201,98],[253,231,37]],
+  inferno: [[0,0,4],[87,16,110],[188,55,84],[249,142,9],[252,255,164]],
+  magma:   [[0,0,4],[80,18,123],[183,55,121],[251,135,97],[252,253,191]],
+  cividis: [[0,32,76],[63,69,108],[124,123,120],[193,184,107],[255,233,69]],
+  YlOrRd:  [[255,255,178],[254,217,118],[254,178,76],[253,141,60],[189,0,38]],
+  RdYlBu:  [[165,0,38],[244,109,67],[255,255,191],[116,173,209],[49,54,149]],
+  Greys:   [[255,255,255],[200,200,200],[140,140,140],[80,80,80],[10,10,10]]
+};
+function _eqRamp(name) {
+  return EQ_RAMPS[name] || EQ_RAMPS.plasma;
+}
+
+function setEarthquakeStyle(style) {
+  // Restyle in place without re-pushing the data.
+  eqStyle = style || {};
+  if (!eqLayer || !style.visible) {
+    if (eqLayer) { map.removeLayer(eqLayer); eqLayer = null; }
+    eqMarkerByIdx = {};
+    _ensureLegend();
+    if (style && style.visible && eqEvents.length) {
+      setEarthquakes(eqEvents, style);
+    }
+    return;
+  }
+  for (var i = 0; i < eqEvents.length; i++) {
+    var ev = eqEvents[i];
+    var m = eqMarkerByIdx[ev.idx];
+    if (!m) continue;
+    var fill = _eqInterp(_eqColorT(ev, style), _eqRamp(style.colormap));
+    m.setRadius(_eqRadius(ev.mag, style.size_scale));
+    m.setStyle({ fillColor: fill });
+    m.setPopupContent(_eqMakePopup(ev, style));
+  }
+  _ensureLegend();
+}
+
+function clearEarthquakes() {
+  if (eqLayer) { map.removeLayer(eqLayer); eqLayer = null; }
+  eqEvents = [];
+  eqMarkerByIdx = {};
+  eqHighlighted = null;
+  _ensureLegend();
+}
+
+function highlightEarthquake(idx, openPopup) {
+  // Restore the previous highlight first.
+  if (eqHighlighted !== null && eqMarkerByIdx[eqHighlighted]) {
+    eqMarkerByIdx[eqHighlighted].setStyle({ weight: 1, color: '#111' });
+  }
+  eqHighlighted = null;
+  if (idx === null || idx === undefined) return;
+  var m = eqMarkerByIdx[idx];
+  if (!m) return;
+  m.setStyle({ weight: 3, color: '#5fb3ff' });
+  m.bringToFront && m.bringToFront();
+  eqHighlighted = idx;
+  if (openPopup) m.openPopup();
+}
+
+function _ensureLegend() {
+  if (eqLegend) { map.removeControl(eqLegend); eqLegend = null; }
+  if (!eqStyle || !eqStyle.visible || !eqEvents.length) return;
+  eqLegend = L.control({ position: 'bottomright' });
+  eqLegend.onAdd = function() {
+    var div = L.DomUtil.create('div', 'eq-legend');
+    var ramp = _eqRamp(eqStyle.colormap);
+    var stops = ramp.map(function(c, i) {
+      var pct = (i / (ramp.length - 1)) * 100;
+      return 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ') ' + pct + '%';
+    }).join(', ');
+    // Encoding is hard-locked: depth → color, magnitude → size.  Treat the
+    // older ``color_by`` payload field as advisory only — the label and
+    // units always reflect depth.
+    var lo = eqStyle.color_min, hi = eqStyle.color_max;
+    div.innerHTML =
+      '<div class="eq-legend-title">Hypocenter depth</div>' +
+      '<div class="eq-legend-ramp" style="background:linear-gradient(to right,' + stops + ');"></div>' +
+      '<div class="eq-legend-row"><span>' + (typeof lo === 'number' ? lo.toFixed(1) : lo) + ' km' +
+      '</span><span>' + (typeof hi === 'number' ? hi.toFixed(1) : hi) + ' km</span></div>' +
+      '<div class="eq-legend-row" style="margin-top:2px;color:#888;">N=' + eqEvents.length + ' · size = magnitude</div>';
+    return div;
+  };
+  eqLegend.addTo(map);
+}
+
 // ── Drawing tools ──────────────────────────────────────────────────────────
-var drawMode     = 'none';   // 'none' | 'profile' | 'viewshed'
+var drawMode     = 'none';   // 'none' | 'profile' | 'viewshed' | 'section'
 var profilePts   = [];
 var profileLine  = null;
 var markerObserver = null;
@@ -199,12 +528,38 @@ function stopViewshedDraw() {
   map.getContainer().classList.remove('map-crosshair');
 }
 
+// Cross-section draw: same UX as the profile tool but emits a different
+// bridge signal so Python can pop up the earthquake section dialog instead
+// of the elevation profile.
+var sectionPts  = [];
+var sectionLine = null;
+function startSectionDraw() {
+  drawMode = 'section';
+  sectionPts = [];
+  if (sectionLine) { map.removeLayer(sectionLine); sectionLine = null; }
+  map.getContainer().classList.add('map-crosshair');
+}
+function stopSectionDraw() {
+  drawMode = 'none';
+  map.getContainer().classList.remove('map-crosshair');
+}
+function clearSection() {
+  if (sectionLine) { map.removeLayer(sectionLine); sectionLine = null; }
+  sectionPts = [];
+}
+
 // ── Python bridge (QWebChannel) ────────────────────────────────────────────
 var bridge = null;
 
 if (typeof QWebChannel !== 'undefined' && typeof qt !== 'undefined') {
   new QWebChannel(qt.webChannelTransport, function(channel) {
     bridge = channel.objects.bridge;
+    // Tell Python the JS side is alive. Without this, Python has no way to
+    // distinguish "page finished loading and Leaflet is rendering" from
+    // "page finished loading but Chromium hit a GPU init failure and
+    // produced a blank canvas" — both report loadFinished(ok=True).
+    try { if (bridge && bridge.onMapReady) bridge.onMapReady(); }
+    catch(e) { /* older bridges may not expose onMapReady */ }
   });
 }
 
@@ -234,6 +589,18 @@ map.on('click', function(e) {
     return;
   }
 
+  if (drawMode === 'section') {
+    sectionPts.push([lat, lon]);
+    if (sectionLine) map.removeLayer(sectionLine);
+    if (sectionPts.length >= 2) {
+      sectionLine = L.polyline(sectionPts, {
+        color: '#5fb3ff', weight: 2, dashArray: '6,4'
+      }).addTo(map);
+    }
+    notifyBridge('onSectionPoint', [lat, lon]);
+    return;
+  }
+
   if (drawMode === 'viewshed') {
     if (markerObserver) map.removeLayer(markerObserver);
     markerObserver = L.marker([lat, lon], {
@@ -255,6 +622,9 @@ map.on('dblclick', function(e) {
   if (drawMode === 'profile') {
     stopProfileDraw();
     notifyBridge('onProfileComplete', []);
+  } else if (drawMode === 'section') {
+    stopSectionDraw();
+    notifyBridge('onSectionComplete', []);
   }
 });
 

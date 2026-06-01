@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QDockWidget, QWidget, QVBoxLayout, QScrollArea,
     QTreeWidget, QTreeWidgetItem, QStackedWidget,
     QFormLayout, QDoubleSpinBox, QSpinBox, QComboBox,
-    QCheckBox, QPushButton, QLabel, QGroupBox, QSizePolicy,
+    QCheckBox, QPushButton, QLabel, QMessageBox,
     QProgressBar, QHBoxLayout,
 )
 
@@ -144,6 +144,10 @@ class StreamsForm(_ParamForm):
         self._thr  = QDoubleSpinBox(); self._thr.setRange(1, 1e9); self._thr.setValue(1000)
         self._auto = QCheckBox("Auto threshold (99th percentile)")
         self._auto.setChecked(True)
+        # Disable the manual threshold spinbox when Auto is on so the UI
+        # accurately reflects which value is in effect.
+        self._auto.toggled.connect(self._thr.setDisabled)
+        self._thr.setDisabled(self._auto.isChecked())
         form.addRow("Min contrib. area:", self._thr)
         form.addRow(self._auto)
 
@@ -420,7 +424,16 @@ class AnalysisPanel(QDockWidget):
             self.start_tool.emit(self._current_product)
 
     def _compute(self):
+        # Without an explicit analysis pick, clicking Compute previously did
+        # nothing visible — users reported "the Compute button doesn't work".
+        # Surface the missing selection so the next click goes to the right
+        # place.
         if not self._current_product:
+            QMessageBox.information(
+                self, "Pick an analysis",
+                "Select an analysis from the tree above (e.g. Hillshade, "
+                "Slope, TWI) before clicking Compute."
+            )
             return
         form = self._forms[self._current_product]
         self.run_analysis.emit(self._current_product, form.params())
@@ -443,12 +456,16 @@ class AnalysisPanel(QDockWidget):
             self._progress.setRange(0, 0)
             self._progress.setVisible(True)
         else:
+            # Make sure the bar is hidden the moment the worker finishes —
+            # otherwise functions that never emit progress (slope, aspect,
+            # hillshade, tpi, …) leave it spinning forever.
             self._progress.setVisible(False)
             self._progress.setRange(0, 100)
             self._progress.setValue(0)
 
     def set_progress(self, pct: int):
         """Switch the bar to determinate mode and show real progress."""
-        self._progress.setRange(0, 100)
+        if self._progress.maximum() == 0:
+            self._progress.setRange(0, 100)
         self._progress.setValue(max(0, min(100, pct)))
         self._progress.setVisible(True)

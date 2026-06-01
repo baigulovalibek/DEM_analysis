@@ -70,37 +70,88 @@ class DemLayer:
     def shape(self) -> Tuple[int, int]:
         return self.data.shape if self.data is not None else (0, 0)
 
+    def _cache_key(self) -> tuple:
+        """Fingerprint that changes whenever the underlying buffer does.
+
+        Uses the buffer's memory address *and* its shape/dtype/nbytes, so
+        even if CPython recycles the same id() for a new array we still
+        detect the change (id-alone would silently return stale data).
+        """
+        arr = self.data
+        if arr is None:
+            return (None, self.nodata)
+        return (
+            arr.ctypes.data,
+            arr.shape,
+            arr.dtype.str,
+            arr.nbytes,
+            self.nodata,
+        )
+
     @property
     def valid_data(self) -> np.ndarray:
-        """Data with nodata masked to NaN."""
+        """Data with nodata masked to NaN.
+
+        The masked copy is memoised against a fingerprint of the underlying
+        buffer so repeated accesses (stats, histogram, profile sampling, 3D
+        view, …) don't rebuild a fresh float copy each time.
+        """
         if self.data is None:
             return np.array([])
-        d = self.data.astype(np.float64)
-        if self.nodata is not None:
-            d[d == self.nodata] = np.nan
-        return d
+        cached = getattr(self, "_valid_cache", None)
+        cache_key = self._cache_key()
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+
+        if (
+            self.nodata is None
+            and np.issubdtype(self.data.dtype, np.floating)
+            and not np.any(~np.isfinite(self.data))
+        ):
+            # No masking needed and no dtype upcast required — share the buffer.
+            out = self.data
+        else:
+            out = self.data.astype(np.float32, copy=True)
+            if self.nodata is not None:
+                out[out == self.nodata] = np.nan
+        self._valid_cache = (cache_key, out)
+        return out
 
     @property
     def stats(self) -> dict:
+        cached = getattr(self, "_stats_cache", None)
+        cache_key = self._cache_key()
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
         d = self.valid_data.ravel()
-        d = d[~np.isnan(d)]
+        d = d[np.isfinite(d)]
         if d.size == 0:
-            return {}
-        return {
-            "min": float(d.min()),
-            "max": float(d.max()),
-            "mean": float(d.mean()),
-            "std": float(d.std()),
-            "count": int(d.size),
-        }
+            stats = {}
+        else:
+            stats = {
+                "min": float(d.min()),
+                "max": float(d.max()),
+                "mean": float(d.mean()),
+                "std": float(d.std()),
+                "count": int(d.size),
+            }
+        self._stats_cache = (cache_key, stats)
+        return stats
 
     def auto_range(self) -> Tuple[float, float]:
         """2nd–98th percentile for stretch, avoiding outlier spikes."""
+        cached = getattr(self, "_range_cache", None)
+        cache_key = self._cache_key()
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
         d = self.valid_data.ravel()
-        d = d[~np.isnan(d)]
+        d = d[np.isfinite(d)]
         if d.size == 0:
-            return 0.0, 1.0
-        lo, hi = np.percentile(d, [2, 98])
-        if lo == hi:
-            lo, hi = d.min(), d.max()
-        return float(lo), float(hi)
+            out = (0.0, 1.0)
+        else:
+            lo, hi = np.percentile(d, [2, 98])
+            if lo == hi:
+                lo, hi = d.min(), d.max()
+            out = (float(lo), float(hi))
+        self._range_cache = (cache_key, out)
+        return out

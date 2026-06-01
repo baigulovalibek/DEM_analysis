@@ -76,19 +76,33 @@ class AnalysisWorker(QThread):
     # ── Thread body ────────────────────────────────────────────────────────
 
     def run(self) -> None:
+        print(f"[worker] starting product={self.product!r}", flush=True)
+        if self._func is None:
+            self.error.emit(
+                "Internal error: analysis dispatcher returned no callable. "
+                "Check Help → Open Diagnostic Log Folder for details."
+            )
+            return
         try:
             try:
                 sig = inspect.signature(self._func)
                 if "_progress" in sig.parameters:
                     self._kwargs["_progress"] = self._emit_progress
-            except (ValueError, TypeError):
+            except Exception:
+                # Some Numba dispatchers and ctypes wrappers don't support
+                # signature introspection. Skip the _progress injection
+                # rather than aborting the analysis over a metadata issue.
                 pass
 
             out = self._func(**self._kwargs)
         except Exception as exc:
             if not self._cancelled:
                 traceback.print_exc()
-                self.error.emit(f"{type(exc).__name__}: {exc}")
+                # Include the product name so users can match the popup to
+                # the analysis they clicked. Without this the dialog just
+                # says "ValueError: ..." with no clue which feature broke.
+                tag = f"[{self.product}] " if self.product else ""
+                self.error.emit(f"{tag}{type(exc).__name__}: {exc}")
             return
 
         if not self._cancelled:
@@ -97,6 +111,8 @@ class AnalysisWorker(QThread):
             # swallow the last tick if it fired inside the 50 ms window.
             self.progress.emit(100)
             self.result.emit(out)
+        print(f"[worker] finished product={self.product!r} cancelled={self._cancelled}",
+              flush=True)
 
     def _emit_progress(self, pct: int) -> bool:
         """Throttled progress relay.

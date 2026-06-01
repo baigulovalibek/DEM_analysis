@@ -5,8 +5,6 @@ from __future__ import annotations
 import numpy as np
 from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QDialogButtonBox
 
-import matplotlib
-matplotlib.use("Agg")
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigCanvas
 from matplotlib.figure import Figure
 

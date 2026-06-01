@@ -16,3 +16,10 @@ packaging/build.log
 packaging/runtime.log
 packaging/stdout*.log
 packaging/stderr*.log
+
+# Timestamped build/dist backups
+build_old_*/
+dist_old_*/
+
+# Reference papers / large binaries
+*.pdf

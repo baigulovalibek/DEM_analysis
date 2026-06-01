@@ -72,27 +72,37 @@ def sample_profile(
     if len(row_col_points) < 2:
         return ElevationProfile(np.array([0.0]), np.array([np.nan]))
 
-    # Densify polyline to uniform spacing
+    # Densify polyline to uniform spacing.  Each segment contributes its
+    # END point; the FIRST segment additionally seeds the polyline start
+    # so the result is monotonically increasing in cumulative distance
+    # with no duplicate samples at internal vertices (the previous loop
+    # produced one duplicate per internal vertex, plus a duplicated
+    # final point).
     sample_rows, sample_cols, cumul_dist = [], [], []
     cum = 0.0
+
+    # Seed with the polyline start so the first segment can append its
+    # interior samples + endpoint without duplicating the vertex.
+    r_start, c_start = row_col_points[0]
+    sample_rows.append(r_start)
+    sample_cols.append(c_start)
+    cumul_dist.append(0.0)
 
     for i in range(len(row_col_points) - 1):
         r0, c0 = row_col_points[i]
         r1, c1 = row_col_points[i + 1]
         seg_len = np.sqrt((r1 - r0) ** 2 + (c1 - c0) ** 2) * cell_size
-        n_steps = max(2, int(np.ceil(seg_len / sample_spacing)))
+        n_steps = max(1, int(np.ceil(seg_len / sample_spacing)))
 
-        for step in range(n_steps):
+        # Walk frac = 1/n .. n/n, i.e. interior samples plus the segment
+        # endpoint.  The segment START was already appended by the
+        # previous iteration's endpoint (or by the seed above).
+        for step in range(1, n_steps + 1):
             frac = step / n_steps
             sample_rows.append(r0 + (r1 - r0) * frac)
             sample_cols.append(c0 + (c1 - c0) * frac)
             cumul_dist.append(cum + seg_len * frac)
         cum += seg_len
-
-    # Add final point
-    sample_rows.append(row_col_points[-1][0])
-    sample_cols.append(row_col_points[-1][1])
-    cumul_dist.append(cum)
 
     sample_rows = np.array(sample_rows)
     sample_cols = np.array(sample_cols)

@@ -32,16 +32,29 @@ def tpi(
     annular      : if True, use an annular (doughnut) window — excludes
                    the inner_radius cells around centre, so TPI reflects
                    landscape position rather than local microtopography
-    inner_radius : inner ring excluded when annular=True
+    inner_radius : inner ring excluded when annular=True; must be ≥ 1 and
+                   strictly less than ``radius``
 
     Returns
     -------
     float32 TPI
     """
+    if annular:
+        if inner_radius < 1:
+            raise ValueError(
+                "tpi(annular=True) requires inner_radius >= 1; "
+                "pass annular=False for a solid window"
+            )
+        if inner_radius >= radius:
+            raise ValueError(
+                f"tpi inner_radius ({inner_radius}) must be smaller than "
+                f"radius ({radius})"
+            )
+
     z = dem.astype(np.float64)
     window = 2 * radius + 1
 
-    if annular and inner_radius >= 1:
+    if annular:
         outer_sum = uniform_filter(z, size=window, mode="nearest") * window ** 2
         inner_w = 2 * inner_radius + 1
         inner_sum = uniform_filter(z, size=inner_w, mode="nearest") * inner_w ** 2

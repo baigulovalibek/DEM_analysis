@@ -20,7 +20,6 @@ def twi(
     slope_rad: np.ndarray,
     cell_size: float,
     slope_min: float = 0.001,
-    nodata: float = None,
 ) -> np.ndarray:
     """
     Parameters
@@ -32,15 +31,24 @@ def twi(
 
     Returns
     -------
-    float32 TWI grid
+    float32 TWI grid.  Cells with zero contributing area or non-finite slope
+    are masked to NaN — those are outlets, nodata, and slope-stencil edges
+    where TWI is not physically defined.
     """
-    a = specific_catchment_area(flow_accum, cell_size).astype(np.float64)
-    beta = np.maximum(slope_rad.astype(np.float64), slope_min)
-    # Guard against zero contributing area (outlet/nodata cells)
-    a = np.maximum(a, cell_size)   # floor at one cell width
-    result = np.log(a / np.tan(beta)).astype(np.float32)
-    result[~np.isfinite(result)] = np.nan
+    fa = flow_accum.astype(np.float64)
+    sr = slope_rad.astype(np.float64)
 
-    if nodata is not None:
-        result[flow_accum == 0] = np.nan
+    a = specific_catchment_area(fa, cell_size).astype(np.float64)
+    beta = np.maximum(sr, slope_min)
+    a = np.maximum(a, cell_size)   # floor at one cell width
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        result = np.log(a / np.tan(beta)).astype(np.float32)
+
+    # A cell only has a meaningful TWI when both inputs are defined AND it
+    # has positive contributing area.  Zero-accumulation cells are usually
+    # outlets, nodata, or cells outside the analysis mask — masking them
+    # to NaN gives consumers a single uniform missing-data indicator.
+    invalid = (fa <= 0) | ~np.isfinite(sr) | ~np.isfinite(result)
+    result[invalid] = np.nan
     return result

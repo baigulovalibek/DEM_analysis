@@ -6,23 +6,38 @@ Python ↔ JavaScript communication:
   JS → Python : MapBridge (QObject exposed via QWebChannel)
 """
 from __future__ import annotations
-import os
 import json
+import sys
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
-from PyQt6.QtCore import QObject, QUrl, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, Qt, QTimer, QUrl, pyqtSignal, pyqtSlot
 from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
+from PyQt6.QtWebEngineCore import QWebEngineSettings
 from PyQt6.QtWebChannel import QWebChannel
-from PyQt6.QtWidgets import QWidget, QVBoxLayout
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel
 
 from app.core.renderer import array_to_png_b64
 from app.core.dem_layer import DemLayer, GeoBounds
 
 
-_HTML_PATH = Path(__file__).parent.parent.parent / "resources" / "map.html"
+def _resource_root() -> Path:
+    """Project root in dev, ``sys._MEIPASS`` in a PyInstaller bundle.
+
+    The spec ships ``resources/`` to the bundle's ``_internal/resources/``
+    directory; in dev mode the same folder lives at the repo root. Going
+    through ``_MEIPASS`` survives onefile/onedir flavour changes and the
+    occasional PyInstaller release that rewrites entry-script ``__file__``
+    semantics.
+    """
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            return Path(meipass)
+    return Path(__file__).resolve().parent.parent.parent
+
+
+_HTML_PATH = _resource_root() / "resources" / "map.html"
 
 
 class MapBridge(QObject):
@@ -34,6 +49,13 @@ class MapBridge(QObject):
     profile_point     = pyqtSignal(float, float)
     profile_complete  = pyqtSignal()
     viewshed_point    = pyqtSignal(float, float)
+    earthquake_clicked = pyqtSignal(int)              # event idx
+    section_point     = pyqtSignal(float, float)
+    section_complete  = pyqtSignal()
+    # Fires once the JS side has finished initialising Leaflet. MapCanvas uses
+    # this to distinguish "loadFinished but the WebEngine rendered a blank
+    # canvas" (no callback) from "the page is alive" (callback within a few s).
+    map_ready          = pyqtSignal()
 
     @pyqtSlot(float, float)
     def onMouseMove(self, lat: float, lon: float):
@@ -59,6 +81,22 @@ class MapBridge(QObject):
     def onViewshedPoint(self, lat: float, lon: float):
         self.viewshed_point.emit(lat, lon)
 
+    @pyqtSlot(int)
+    def onEarthquakeClick(self, idx: int):
+        self.earthquake_clicked.emit(idx)
+
+    @pyqtSlot(float, float)
+    def onSectionPoint(self, lat: float, lon: float):
+        self.section_point.emit(lat, lon)
+
+    @pyqtSlot()
+    def onSectionComplete(self):
+        self.section_complete.emit()
+
+    @pyqtSlot()
+    def onMapReady(self):
+        self.map_ready.emit()
+
 
 class MapCanvas(QWidget):
     """
@@ -73,10 +111,26 @@ class MapCanvas(QWidget):
 
     coordinate_changed = pyqtSignal(float, float)   # lat, lon from hover
     clicked            = pyqtSignal(float, float)
+    # Fires when the watchdog detects a blank canvas. MainWindow uses this
+    # to prompt the user with concrete recovery actions (restart in safe-gfx
+    # mode, reload the map, …). Emitted at most once per launch.
+    map_unresponsive   = pyqtSignal()
+
+    # Time we give Leaflet to fire onMapReady after loadFinished(ok=True).
+    # Past this we assume Chromium produced a blank canvas (typical on
+    # machines where the GPU init failed and DEM_ANALYST_SAFE_GFX wasn't
+    # set) and show a recovery banner.
+    _READY_TIMEOUT_MS = 6000
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._page_ready = False
+        self._map_alive = False
+        # Try one silent reload before giving up — sometimes QWebChannel hands
+        # off late and Leaflet initialises after a refresh. Only the second
+        # failure surfaces a UI prompt.
+        self._reload_attempts = 0
+        self._unresponsive_emitted = False
         self._pending_js: list[str] = []
         self._setup_ui()
         self._setup_channel()
@@ -90,9 +144,29 @@ class MapCanvas(QWidget):
         self._view.settings().setAttribute(
             QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True
         )
+        # Some QtWebEngine builds also require this for local file:// pages to
+        # XHR-load adjacent files. Vendored Leaflet uses <script> tags so this
+        # is belt-and-braces, but flipping it on costs nothing.
+        self._view.settings().setAttribute(
+            QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True
+        )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._view)
+
+        # Recovery banner shown when Chromium loads but produces a blank
+        # canvas (the usual cause of "the map is blank on my coworker's PC").
+        # Hidden by default; floats above the QWebEngineView.
+        self._diagnostic = QLabel(self)
+        self._diagnostic.setWordWrap(True)
+        self._diagnostic.setTextFormat(Qt.TextFormat.RichText)
+        self._diagnostic.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._diagnostic.setStyleSheet(
+            "QLabel { background: rgba(40,20,10,235); color: #ffd9a8; "
+            "border: 1px solid #c8843a; padding: 16px; font-size: 12px; }"
+        )
+        self._diagnostic.setOpenExternalLinks(False)
+        self._diagnostic.hide()
 
     def _setup_channel(self):
         self._bridge = MapBridge(self)
@@ -102,11 +176,13 @@ class MapCanvas(QWidget):
 
         self._bridge.mouse_moved.connect(self.coordinate_changed)
         self._bridge.map_clicked.connect(self.clicked)
+        self._bridge.map_ready.connect(self._on_map_ready)
 
     def _load_map(self):
         if _HTML_PATH.exists():
             url = QUrl.fromLocalFile(str(_HTML_PATH))
         else:
+            print(f"[MapCanvas] map.html not found at {_HTML_PATH}", file=sys.stderr)
             url = QUrl("about:blank")
         self._view.loadFinished.connect(self._on_load_finished)
         self._view.load(url)
@@ -114,12 +190,80 @@ class MapCanvas(QWidget):
     def _on_load_finished(self, ok: bool):
         self._page_ready = bool(ok)
         if not ok:
+            # Surface the failure rather than silently disabling the map.
+            print(
+                f"[MapCanvas] Failed to load {_HTML_PATH} — the map will be blank.",
+                file=sys.stderr,
+            )
+            self._show_diagnostic(
+                "<b>Map page failed to load.</b><br/><br/>"
+                f"Could not load <code>{_HTML_PATH.name}</code>. The "
+                "<code>resources/</code> folder may be missing or unreadable. "
+                "Reinstall or re-extract the bundle and try again."
+            )
             return
         # Flush any JS that was requested before the page finished loading
         # (e.g. a DEM opened from the command line during start-up).
         pending, self._pending_js = self._pending_js, []
         for code in pending:
             self._view.page().runJavaScript(code)
+
+        # If onMapReady doesn't fire within the watchdog window, we assume
+        # Chromium initialised but rendered a blank canvas (the typical
+        # "blank map" symptom on locked-down or driver-broken Windows
+        # machines). Pop a banner explaining the workaround.
+        QTimer.singleShot(self._READY_TIMEOUT_MS, self._check_map_alive)
+
+    def _on_map_ready(self):
+        self._map_alive = True
+        self._diagnostic.hide()
+
+    def _check_map_alive(self):
+        if self._map_alive:
+            return
+        # First failure: silently retry once. QtWebEngine sometimes wins the
+        # race only on a second pass (the QWebChannel handshake can land
+        # after the page already finished loading).
+        if self._reload_attempts == 0:
+            self._reload_attempts = 1
+            print("[MapCanvas] map silent after load — reloading once",
+                  file=sys.stderr)
+            self._page_ready = False
+            self._view.reload()
+            return
+        # Second failure: surface to MainWindow so the user can pick a
+        # recovery action with full context (which safe-gfx state they're
+        # already in, etc.). Also show the inline banner as a fallback in
+        # case the parent ignores the signal.
+        if not self._unresponsive_emitted:
+            self._unresponsive_emitted = True
+            self.map_unresponsive.emit()
+        self._show_diagnostic(
+            "<b>Map is not rendering.</b><br/><br/>"
+            "The WebEngine page loaded but Leaflet didn't initialise — this "
+            "is almost always a graphics-driver / GPU-init failure on the "
+            "current machine.<br/><br/>"
+            "Use <b>Help → Safe Graphics Mode</b> to switch Chromium to "
+            "software rendering, then restart DEM Analyst."
+        )
+
+    def _show_diagnostic(self, html: str):
+        self._diagnostic.setText(html)
+        # Re-position the banner over the centre of the view.
+        margin = 24
+        w = max(320, self.width() - 2 * margin)
+        h = 220
+        x = (self.width() - w) // 2
+        y = (self.height() - h) // 2
+        self._diagnostic.setGeometry(x, max(margin, y), w, h)
+        self._diagnostic.raise_()
+        self._diagnostic.show()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Keep the diagnostic banner centred when the user resizes the window.
+        if self._diagnostic.isVisible():
+            self._show_diagnostic(self._diagnostic.text())
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -140,8 +284,15 @@ class MapCanvas(QWidget):
         hi = layer.render_max
         if lo is None or hi is None:
             lo, hi = layer.auto_range()
+        # D8 flow direction grids are categorical (8 power-of-two codes), so
+        # bypass the continuous stretch and use a fixed LUT instead.
+        categorical = (
+            layer.product == "flow_direction"
+            and np.issubdtype(layer.data.dtype, np.integer)
+        )
         data_url = array_to_png_b64(
-            layer.data, layer.colormap, lo, hi, layer.nodata
+            layer.data, layer.colormap, lo, hi, layer.nodata,
+            categorical=categorical,
         )
         b = layer.bounds
         self.run_js(
@@ -196,6 +347,58 @@ class MapCanvas(QWidget):
 
     def stop_viewshed_draw(self):
         self.run_js('stopViewshedDraw();')
+
+    def start_section_draw(self):
+        self.run_js('startSectionDraw();')
+
+    def stop_section_draw(self):
+        self.run_js('stopSectionDraw();')
+
+    def clear_section(self):
+        self.run_js('clearSection();')
+
+    # ── Earthquake catalog ─────────────────────────────────────────────────
+
+    def set_earthquakes(self, events: list[dict], style: dict):
+        """Push the full catalog payload + style to the map."""
+        self.run_js(
+            f'setEarthquakes({json.dumps(events)}, {json.dumps(style)});'
+        )
+
+    def set_earthquake_style(self, style: dict):
+        self.run_js(f'setEarthquakeStyle({json.dumps(style)});')
+
+    def clear_earthquakes(self):
+        self.run_js('clearEarthquakes();')
+
+    def highlight_earthquake(self, idx: int | None, open_popup: bool = True):
+        idx_js = "null" if idx is None else str(int(idx))
+        flag = "true" if open_popup else "false"
+        self.run_js(f'highlightEarthquake({idx_js}, {flag});')
+
+    # ── 3D view sync ───────────────────────────────────────────────────────
+
+    def set_camera_frustum(
+        self,
+        corners_latlon: list[tuple[float, float]] | None,
+        camera_latlon: tuple[float, float] | None = None,
+    ):
+        """Show / hide the 3D camera's ground frustum on the 2D map.
+
+        ``corners_latlon`` is a list of ``(lat, lon)`` tuples (typically four)
+        tracing the camera's view extent on the ground plane.  Pass ``None``
+        to clear the overlay.
+        """
+        if not corners_latlon:
+            self.run_js('setCameraFrustum(null, null);')
+            return
+        corners_js = json.dumps([[lat, lon] for lat, lon in corners_latlon])
+        cam_js = (
+            json.dumps([camera_latlon[0], camera_latlon[1]])
+            if camera_latlon is not None
+            else "null"
+        )
+        self.run_js(f'setCameraFrustum({corners_js}, {cam_js});')
 
     # ── Bridge signal accessors ────────────────────────────────────────────
 

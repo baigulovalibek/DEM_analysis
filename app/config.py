@@ -47,6 +47,3 @@ COLORMAPS = {
 
 # Default opacity for new overlay layers
 DEFAULT_OPACITY = 0.75
-
-# Min cell count below which single-threaded computation is used
-PARALLEL_THRESHOLD = 500 * 500
