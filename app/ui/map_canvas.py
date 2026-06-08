@@ -17,7 +17,7 @@ from PyQt6.QtWebEngineCore import QWebEngineSettings
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel
 
-from app.core.renderer import array_to_png_b64
+from app.core.renderer import array_to_png_b64_sized
 from app.core.dem_layer import DemLayer, GeoBounds
 
 
@@ -290,14 +290,19 @@ class MapCanvas(QWidget):
             layer.product == "flow_direction"
             and np.issubdtype(layer.data.dtype, np.integer)
         )
-        data_url = array_to_png_b64(
+        data_url, px_w, px_h = array_to_png_b64_sized(
             layer.data, layer.colormap, lo, hi, layer.nodata,
             categorical=categorical,
         )
         b = layer.bounds
+        # px_w / px_h are the overlay's native (post-decimation) resolution.
+        # The map page uses them to render the overlay smoothly while it is
+        # shown at or below native size, and crisply once it is upscaled past
+        # native — so zooming in to inspect cells stays sharp instead of blurry.
         self.run_js(
             f'addDEMOverlay({json.dumps(layer.name)}, {json.dumps(data_url)}, '
-            f'{b.south}, {b.west}, {b.north}, {b.east}, {layer.opacity});'
+            f'{b.south}, {b.west}, {b.north}, {b.east}, {layer.opacity}, '
+            f'{px_w}, {px_h});'
         )
         if not layer.visible:
             self.set_visible(layer.name, False)
@@ -330,6 +335,36 @@ class MapCanvas(QWidget):
     def set_base_layer(self, name: str):
         """name: 'osm' | 'satellite' | 'topo'"""
         self.run_js(f'setBaseLayer({json.dumps(name)});')
+
+    # ── Value legend ─────────────────────────────────────────────────────────
+
+    def set_legend(
+        self,
+        title: str,
+        stops: list[str],
+        vmin: float,
+        vmax: float,
+        units: str = "",
+        categorical: list[dict] | None = None,
+    ):
+        """Show the colour→value legend for the selected raster overlay.
+
+        ``stops`` is an evenly spaced list of ``"#rrggbb"`` colours (low→high);
+        ``categorical`` (when given) is a list of ``{"label", "color"}`` dicts
+        and takes precedence, rendering discrete swatches instead of a ramp.
+        """
+        payload = {
+            "title": title,
+            "stops": stops,
+            "vmin": vmin,
+            "vmax": vmax,
+            "units": units,
+            "categorical": categorical,
+        }
+        self.run_js(f'setLegend({json.dumps(payload)});')
+
+    def clear_legend(self):
+        self.run_js('clearLegend();')
 
     # ── Drawing tools ──────────────────────────────────────────────────────
 

@@ -27,12 +27,12 @@ import rasterio
 from rasterio.crs import CRS
 from rasterio.warp import transform_bounds
 
-from app.config import COLORMAPS, DEFAULT_OPACITY
+from app.config import COLORMAPS, DEFAULT_OPACITY, LEGEND_UNITS
 from app.core.dem_layer import DemLayer, GeoBounds
 from app.core.earthquakes import EarthquakeCatalog
 from app.core.layer_manager import LayerManager
 from app.core.worker import AnalysisWorker
-from app.core.renderer import array_to_png_b64
+from app.core.renderer import array_to_png_b64, colormap_stops, d8_legend_entries
 
 from app.ui.map_canvas import MapCanvas
 from app.ui.layer_panel import LayerPanel
@@ -287,6 +287,9 @@ class MainWindow(QMainWindow):
         self._mgr.active_dem_changed.connect(
             lambda _name: self._sync_3d_active_dem(self._mgr.active_dem)
         )
+        # Keep the map's colour→value legend tied to the selected layer.
+        self._mgr.layer_selected.connect(self._update_legend)
+        self._mgr.layers_changed.connect(self._refresh_legend)
 
         # Map canvas-level signals (watchdog, etc.) bypass the JS bridge.
         self._map.map_unresponsive.connect(self._on_map_unresponsive)
@@ -468,6 +471,50 @@ class MainWindow(QMainWindow):
             self._map.refresh_layer(layer)
             # Re-adding the overlay resets its stacking order.
             self._reapply_layer_order()
+            # Colormap / render-range edits change what the legend should show.
+            self._update_legend(name)
+
+    # ── Value legend ─────────────────────────────────────────────────────────
+
+    def _update_legend(self, name: str):
+        """Push the colour→value legend for ``name`` to the map (or clear it)."""
+        layer = self._mgr.get(name)
+        if layer is None or layer.data is None:
+            self._map.clear_legend()
+            return
+
+        # D8 flow-direction grids are categorical — a gradient would be
+        # meaningless, so show the eight direction swatches instead.
+        if (
+            layer.product == "flow_direction"
+            and np.issubdtype(layer.data.dtype, np.integer)
+        ):
+            cats = [{"label": lbl, "color": col} for lbl, col in d8_legend_entries()]
+            self._map.set_legend(layer.name, [], 0.0, 0.0, categorical=cats)
+            return
+
+        lo = layer.render_min
+        hi = layer.render_max
+        if lo is None or hi is None:
+            lo, hi = layer.auto_range()
+        self._map.set_legend(
+            layer.name,
+            colormap_stops(layer.colormap),
+            float(lo),
+            float(hi),
+            units=LEGEND_UNITS.get(layer.product, ""),
+        )
+
+    def _refresh_legend(self):
+        """Re-evaluate the legend after the layer stack changes (add/remove).
+
+        Falls back to clearing when the selected layer is gone.
+        """
+        sel = self._mgr.selected
+        if sel is None:
+            self._map.clear_legend()
+        else:
+            self._update_legend(sel.name)
 
     def _on_layer_updated(self, name: str):
         layer = self._mgr.get(name)

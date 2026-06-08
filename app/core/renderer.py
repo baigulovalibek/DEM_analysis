@@ -16,12 +16,7 @@ from PIL import Image
 
 from PyQt6.QtGui import QImage
 
-
-# Overlays larger than this (in either dimension) are downsampled before
-# being encoded as a PNG — a huge base64 image makes the embedded browser
-# sluggish when several layers are stacked.  The overlay stays georeferenced
-# to the same bounds, so downsampling only lowers its display resolution.
-_MAX_OVERLAY_DIM = 2048
+from app.config import MAX_OVERLAY_DIM as _MAX_OVERLAY_DIM
 
 
 def _decimate(
@@ -94,6 +89,43 @@ def _categorical_d8_rgba(arr: np.ndarray, alpha: float = 1.0) -> np.ndarray:
     return rgba
 
 
+# Human-readable compass labels for the D8 codes, in the order the legend
+# should list them (N first, going clockwise).  Keys match the LUT above.
+_D8_DIRECTION_LABELS = [
+    (64,  "N"),  (128, "NE"), (1,  "E"),  (2,   "SE"),
+    (4,   "S"),  (8,   "SW"), (16, "W"),  (32,  "NW"),
+]
+
+
+def colormap_stops(cmap: str = "terrain", n: int = 12) -> list:
+    """Return ``n`` evenly spaced ``"#rrggbb"`` colours across a colormap.
+
+    Sampled from low (0.0) to high (1.0) so the caller can build a CSS
+    ``linear-gradient`` legend that matches what ``array_to_rgba`` paints —
+    without re-implementing matplotlib's colormaps in JavaScript.
+    """
+    cm = plt.get_cmap(cmap)
+    stops = []
+    for i in range(n):
+        t = i / (n - 1) if n > 1 else 0.0
+        r, g, b, _ = cm(t)
+        stops.append(
+            "#{:02x}{:02x}{:02x}".format(
+                int(round(r * 255)), int(round(g * 255)), int(round(b * 255))
+            )
+        )
+    return stops
+
+
+def d8_legend_entries() -> list:
+    """``[(label, "#rrggbb"), …]`` for the D8 flow-direction categorical LUT."""
+    out = []
+    for code, label in _D8_DIRECTION_LABELS:
+        r, g, b, _ = _D8_CATEGORICAL_COLORS[code]
+        out.append((label, "#{:02x}{:02x}{:02x}".format(r, g, b)))
+    return out
+
+
 def array_to_rgba(
     data: np.ndarray,
     cmap: str = "terrain",
@@ -149,6 +181,32 @@ def rgba_to_qimage(rgba: np.ndarray) -> QImage:
     return img.copy()
 
 
+def array_to_png_b64_sized(
+    data: np.ndarray,
+    cmap: str = "terrain",
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    nodata: Optional[float] = None,
+    categorical: bool = False,
+) -> Tuple[str, int, int]:
+    """As :func:`array_to_png_b64`, but also return the encoded ``(width, height)``.
+
+    The caller (Leaflet bridge) needs the *post-decimation* pixel size to decide
+    when an overlay is being upscaled past its native resolution — that is the
+    moment to switch from smooth interpolation (which blurs) to crisp/pixelated
+    rendering so the analyst sees real cells instead of a blurry stretch.
+    """
+    data = _decimate(data, categorical=categorical)
+    rgba = array_to_rgba(data, cmap, vmin, vmax, nodata, alpha=1.0,
+                         categorical=categorical)
+    img = Image.fromarray(rgba, "RGBA")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=False)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    h, w = rgba.shape[:2]
+    return f"data:image/png;base64,{b64}", w, h
+
+
 def array_to_png_b64(
     data: np.ndarray,
     cmap: str = "terrain",
@@ -158,14 +216,10 @@ def array_to_png_b64(
     categorical: bool = False,
 ) -> str:
     """Encode array as base64 PNG data-URL suitable for Leaflet imageOverlay."""
-    data = _decimate(data, categorical=categorical)
-    rgba = array_to_rgba(data, cmap, vmin, vmax, nodata, alpha=1.0,
-                         categorical=categorical)
-    img = Image.fromarray(rgba, "RGBA")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=False)
-    b64 = base64.b64encode(buf.getvalue()).decode()
-    return f"data:image/png;base64,{b64}"
+    url, _w, _h = array_to_png_b64_sized(
+        data, cmap, vmin, vmax, nodata, categorical=categorical
+    )
+    return url
 
 
 def hillshade_rgba(

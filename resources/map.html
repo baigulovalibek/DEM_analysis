@@ -25,14 +25,20 @@
       color: #888 !important;
     }
     .leaflet-control-attribution a { color: #aaa !important; }
-    /* Smooth interpolation for DEM image overlays.  By default some
-       browser/leaflet combinations render PNG overlays with nearest-neighbour
-       upscaling, which makes derived rasters look very blocky when zoomed in.
-       The values below ask for smooth (bilinear) scaling. */
+    /* DEM overlay scaling.  Default to smooth (bilinear) interpolation: this
+       is right while an overlay is shown at or below its native resolution
+       (clean fit-view, anti-aliased downscale).  Forcing smooth scaling at ALL
+       zooms, however, blurs the overlay the moment it is upscaled past native
+       — the usual "my DEM looks blurry when I zoom in" complaint.  So when JS
+       detects upscaling it adds .crisp, which renders real cells sharply
+       (nearest-neighbour) — the GIS-correct view for inspecting data. */
     .leaflet-image-layer {
       image-rendering: auto;
-      image-rendering: smooth;
-      image-rendering: -webkit-optimize-contrast;
+    }
+    .leaflet-image-layer.crisp {
+      image-rendering: -webkit-optimize-contrast; /* legacy Chromium */
+      image-rendering: crisp-edges;
+      image-rendering: pixelated;                  /* wins where supported */
     }
     /* Crosshair cursor during profile/viewshed tools */
     .map-crosshair { cursor: crosshair !important; }
@@ -103,6 +109,53 @@
       display: flex;
       justify-content: space-between;
       color: #aaa;
+    }
+    /* Raster value → colour legend (DEM, hillshade, slope, …) */
+    .dem-legend {
+      background: rgba(30,30,30,0.85);
+      color: #ddd;
+      padding: 6px 8px 4px;
+      border: 1px solid #555;
+      border-radius: 4px;
+      font: 10px/1.3 sans-serif;
+      min-width: 130px;
+      max-width: 200px;
+    }
+    .dem-legend .dem-legend-title {
+      font-weight: bold;
+      margin-bottom: 3px;
+      color: #fff;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .dem-legend .dem-legend-ramp {
+      height: 10px;
+      border: 1px solid #444;
+      margin-bottom: 2px;
+    }
+    .dem-legend .dem-legend-row {
+      display: flex;
+      justify-content: space-between;
+      color: #aaa;
+    }
+    .dem-legend .dem-legend-cats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1px 8px;
+    }
+    .dem-legend .dem-legend-cat {
+      display: flex;
+      align-items: center;
+      color: #ccc;
+    }
+    .dem-legend .dem-legend-swatch {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      margin-right: 4px;
+      border: 1px solid #444;
+      flex: 0 0 auto;
     }
     /* Highlighted earthquake (clicked from 2D or 3D) */
     .eq-highlight {
@@ -218,7 +271,8 @@ function setCameraFrustum(corners /* [[lat, lon], …, [lat, lon]] or null */,
 // ── DEM overlay store ──────────────────────────────────────────────────────
 var demLayers = {};     // name → L.imageOverlay
 
-function addDEMOverlay(name, dataUrl, south, west, north, east, opacity, zIndex) {
+function addDEMOverlay(name, dataUrl, south, west, north, east, opacity,
+                       nativeW, nativeH, zIndex) {
   removeDEMOverlay(name);
   var bounds = [[south, west], [north, east]];
   // NB: do NOT pass crossOrigin on a data: URL. Some Chromium builds (the one
@@ -230,7 +284,37 @@ function addDEMOverlay(name, dataUrl, south, west, north, east, opacity, zIndex)
     interactive:   false
   }).addTo(map);
   if (zIndex !== undefined) ov.setZIndex(zIndex);
+  // Native (post-decimation) PNG width in pixels, used to decide smooth-vs-crisp
+  // rendering as the user zooms (see _applyCrispness).
+  ov._nativeW = nativeW || 0;
   demLayers[name] = ov;
+  // The <img> may not exist until the data URL decodes; apply now (covers the
+  // common case where it is already attached) and again on load.
+  _applyCrispness(ov);
+  var el = ov.getElement && ov.getElement();
+  if (el) el.addEventListener('load', function() { _applyCrispness(ov); });
+}
+
+// Toggle crisp (nearest-neighbour) rendering on an overlay when it is being
+// upscaled past its native resolution, otherwise leave it smooth.  Compares
+// the overlay's on-screen size in *device* pixels (CSS px × devicePixelRatio,
+// so HiDPI displays are handled) against the source PNG width.
+function _applyCrispness(ov) {
+  if (!ov || !ov._nativeW) return;
+  var el = ov.getElement && ov.getElement();
+  if (!el) return;
+  var b = ov.getBounds();
+  var nw = map.latLngToContainerPoint(b.getNorthWest());
+  var ne = map.latLngToContainerPoint(b.getNorthEast());
+  var screenW = Math.abs(ne.x - nw.x);
+  var dpr = window.devicePixelRatio || 1;
+  // 1.02 margin avoids flicker right at the native-resolution crossover.
+  if (screenW * dpr > ov._nativeW * 1.02) el.classList.add('crisp');
+  else                                    el.classList.remove('crisp');
+}
+
+function _refreshAllCrispness() {
+  for (var k in demLayers) _applyCrispness(demLayers[k]);
 }
 
 function removeDEMOverlay(name) {
@@ -495,6 +579,68 @@ function _ensureLegend() {
   eqLegend.addTo(map);
 }
 
+// ── Raster value legend ─────────────────────────────────────────────────────
+// Attributes colour → value for the currently selected raster overlay (DEM,
+// hillshade, slope, …).  Python supplies pre-sampled colour stops so this side
+// never has to know about matplotlib colormaps.  Sits bottom-left, clear of
+// the earthquake depth legend (bottom-right).
+var demLegend = null;
+
+function _escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, function(c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+function _fmtLegendVal(v) {
+  if (typeof v !== 'number' || !isFinite(v)) return String(v);
+  var a = Math.abs(v);
+  if (a !== 0 && (a < 1e-3 || a >= 1e5)) return v.toExponential(1);
+  if (a >= 100) return v.toFixed(0);
+  if (a >= 1)   return v.toFixed(1);
+  return v.toFixed(3);
+}
+
+function setLegend(payload) {
+  // payload: { title, stops:[…hex], vmin, vmax, units, categorical:[{label,color}] }
+  if (demLegend) { map.removeControl(demLegend); demLegend = null; }
+  if (!payload) return;
+  demLegend = L.control({ position: 'bottomleft' });
+  demLegend.onAdd = function() {
+    var div = L.DomUtil.create('div', 'dem-legend');
+    L.DomEvent.disableClickPropagation(div);
+    var html = '<div class="dem-legend-title">' + _escapeHtml(payload.title || '') + '</div>';
+    var cats = payload.categorical;
+    if (cats && cats.length) {
+      html += '<div class="dem-legend-cats">';
+      for (var i = 0; i < cats.length; i++) {
+        html += '<div class="dem-legend-cat">' +
+                '<span class="dem-legend-swatch" style="background:' + cats[i].color + ';"></span>' +
+                _escapeHtml(cats[i].label) + '</div>';
+      }
+      html += '</div>';
+    } else if (payload.stops && payload.stops.length) {
+      var n = payload.stops.length;
+      var stops = payload.stops.map(function(c, i) {
+        return c + ' ' + ((n > 1 ? i / (n - 1) : 0) * 100) + '%';
+      }).join(', ');
+      var units = payload.units ? ' ' + payload.units : '';
+      html += '<div class="dem-legend-ramp" style="background:linear-gradient(to right,' + stops + ');"></div>' +
+              '<div class="dem-legend-row">' +
+                '<span>' + _fmtLegendVal(payload.vmin) + units + '</span>' +
+                '<span>' + _fmtLegendVal(payload.vmax) + units + '</span>' +
+              '</div>';
+    }
+    div.innerHTML = html;
+    return div;
+  };
+  demLegend.addTo(map);
+}
+
+function clearLegend() {
+  if (demLegend) { map.removeControl(demLegend); demLegend = null; }
+}
+
 // ── Drawing tools ──────────────────────────────────────────────────────────
 var drawMode     = 'none';   // 'none' | 'profile' | 'viewshed' | 'section'
 var profilePts   = [];
@@ -632,6 +778,10 @@ map.on('zoomend moveend', function() {
   var c = map.getCenter();
   notifyBridge('onMapMoved', [c.lat, c.lng, map.getZoom()]);
 });
+
+// Re-evaluate smooth-vs-crisp rendering whenever the zoom changes, so overlays
+// stay sharp when zoomed in past native resolution and smooth otherwise.
+map.on('zoomend', _refreshAllCrispness);
 </script>
 </body>
 </html>

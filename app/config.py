@@ -45,5 +45,24 @@ COLORMAPS = {
     "dem":                   "terrain",
 }
 
+# Units shown on the map legend's min/max labels, per product.  Only entries
+# whose units are unambiguous are listed; everything else (indices, ratios,
+# direction-configurable slope, …) renders without a unit suffix.
+LEGEND_UNITS = {
+    "dem":        "m",
+    "fill_sinks": "m",
+    "aspect":     "°",
+    "twi":        "",
+    "spi":        "",
+}
+
 # Default opacity for new overlay layers
 DEFAULT_OPACITY = 0.75
+
+# Maximum pixel dimension (either axis) of a DEM overlay PNG pushed to Leaflet.
+# Larger rasters are NaN-aware block-averaged down to this size before encoding,
+# trading display resolution for a smaller base64 payload.  4096 keeps a full
+# 1°×1° SRTM tile (3601²) at native resolution; raise it for sharper overlays
+# at the cost of a larger payload / slower style refreshes, lower it if the
+# embedded browser feels sluggish with several layers stacked.
+MAX_OVERLAY_DIM = 4096
